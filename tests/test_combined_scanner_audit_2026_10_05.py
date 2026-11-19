@@ -36,7 +36,8 @@ def test_total_native_failure_invalidates_pipeline_readiness(combined, monkeypat
     pipeline.require_fresh_result('NIFTY', '5min')
     result = pipeline.process_instrument('NIFTY')
     assert result.timeframe_metadata['5min']['result']['status'] == 'processing_error'
-    assert result.results_5min is None
+    assert result.results_5min['combined_health'] == 'HALTED'
+    assert result.results_5min['signals'] == []
     assert 'NIFTY_5min' not in pipeline._result_cache
 
 

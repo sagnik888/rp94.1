@@ -4657,7 +4657,9 @@ class SignalProcessor:
         source = str(getattr(signal, "source_engine", "") or "").lower()
         if source in {"flow_burst", "apex_hybrid"}:
             return "B"
-        if configured_mode() in COMBINED_MODES and not source in {"s1", "ut_smart"}:
+        if lane == "QP" or (configured_mode() in COMBINED_MODES and source in {
+            "quad_prime", "utbot", "ema", "supertrend", "consensus", "multi",
+        }):
             return "QP"
         if source == "s1":
             # Persisted on the trade (source_engine is not), so a restart keeps the S1 lane.
@@ -4822,7 +4824,18 @@ class SignalProcessor:
         return streams
 
     @staticmethod
-    def _historical_replay_order(signals: List[UTBotSignal], scanner_engine_mode: str = "") -> List[UTBotSignal]:
+    def _historical_replay_order(
+        signals: List[UTBotSignal], scanner_engine_mode: str = "", *, source_attribution: bool = True,
+    ) -> List[UTBotSignal]:
+        if scanner_engine_mode in {"quad_union", "quad_prime"} and not source_attribution:
+            # Same merged candidate as the live scanner, including all source tags.
+            # This is still a bar-based historical simulation.
+            ordered = []
+            for signal in sorted(signals, key=lambda item: item.timestamp):
+                cloned = copy.copy(signal)
+                cloned._historical_replay_stream = "main"
+                ordered.append(cloned)
+            return ordered
         return [
             sig
             for stream in SignalProcessor._historical_replay_streams(signals, scanner_engine_mode)
@@ -5214,7 +5227,7 @@ class SignalProcessor:
         for tf in candidate_timeframes:
             sigs = [] # Master Fix: Clear sigs to prevent stale leak from previous iterations
             result = getattr(mtf_result, f"results_{tf}", None)
-            if result is None:
+            if not result or result.get("error"):
                 if tf == "15min": logger.debug(f"⚠️ No 15min results for {instrument} yet.")
                 continue
             sigs = [s for s in result.get("signals", []) if s.instrument == instrument]
@@ -5324,6 +5337,8 @@ class SignalProcessor:
                     sigs = self._historical_replay_order(
                         [s for s in sigs if s.instrument == instrument and s.timestamp.date() >= data_cutoff],
                         scanner_engine_mode,
+                        source_attribution=_setting_enabled(
+                            getattr(settings, "historical_quad_source_attribution", False), False),
                     )
                     
                     # Process signals for this TF
@@ -8011,11 +8026,12 @@ class SignalProcessor:
         # All explicit policies apply to every engine and historical replay. Legacy
         # 15M retains Quad Prime's established raw multi-source exception; old 15M /
         # 5M+15M modes also preserve established fast 1m spike/snapback routes.
-        legacy_fast_one_min_policy = True   # 1m burst/snapback under every policy
+        strict_timeframes = bool(getattr(settings, "strict_entry_timeframes", False))
+        legacy_fast_one_min_policy = not strict_timeframes
         legacy_quad_prime_bypass = (
-            tf_policy == "PRIMARY_15" and scanner_engine_mode == "quad_prime"
+            not strict_timeframes and tf_policy == "PRIMARY_15" and scanner_engine_mode == "quad_prime"
         )
-        if not legacy_quad_prime_bypass and scanner_engine_mode != "one_plus_one":
+        if not legacy_quad_prime_bypass and (strict_timeframes or scanner_engine_mode != "one_plus_one"):
             entry_candidates_raw = [
                 c
                 for c in entry_candidates_raw

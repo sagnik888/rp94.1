@@ -87,7 +87,9 @@ class TestUpstoxFailoverIntegration(unittest.TestCase):
             self.assertIn("call_delta", df.columns)
             self.assertIn("put_delta", df.columns)
             self.assertEqual(df.attrs.get("source"), "upstox")
-            self.assertEqual(df.attrs.get("auto_certified"), True)
+            self.assertEqual(df.attrs.get("expiry"), "2026-11-20")
+            self.assertEqual(df.iloc[0]["call_token"], "NSE_FO|12345")
+            self.assertNotIn("auto_certified", df.attrs)
 
 
 if __name__ == "__main__":

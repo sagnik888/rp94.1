@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from typing import Iterable, Set
 
@@ -32,8 +32,20 @@ NSE_HOLIDAYS_BY_YEAR = {
 NSE_SPECIAL_TRADING_DAYS_BY_YEAR = {
     2026: {
         "2026-02-01",
+        "2026-11-08",
     }
 }
+
+# Index candle session for Diwali Muhurat trading (NSE/CMTR/76941).
+# Derivatives have a separate schedule.
+INDEX_SPECIAL_SESSION_HOURS = {
+    "2026-11-08": (time(14, 20), time(15, 30)),
+}
+
+
+def index_session_bounds(at: datetime) -> tuple[datetime, datetime]:
+    opening, closing = INDEX_SPECIAL_SESSION_HOURS.get(at.date().isoformat(), (time(9, 15), time(15, 30)))
+    return datetime.combine(at.date(), opening, tzinfo=at.tzinfo), datetime.combine(at.date(), closing, tzinfo=at.tzinfo)
 
 
 def _normalize_dates(values: Iterable[object]) -> Set[str]:

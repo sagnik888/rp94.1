@@ -31,7 +31,9 @@ def owner(obj):
         return 's1'
     if lane == 'UTS' or source == 'ut_smart':
         return 'ut_smart'
-    return 'quad_prime'
+    if lane == 'QP' or source in {'quad_prime', 'utbot', 'ema', 'supertrend', 'consensus', 'multi'}:
+        return 'quad_prime'
+    return 'unknown'
 
 
 def scanner_mode(settings=None, obj=None):
@@ -70,4 +72,7 @@ def native_result(obj, result):
 
 def same_owner(left, right, settings=None):
     mode = configured_mode(settings)
-    return mode not in COMBINED_MODES and mode not in INDEPENDENT_LANE_MODES or owner(left) == owner(right)
+    if mode not in COMBINED_MODES and mode not in INDEPENDENT_LANE_MODES:
+        return True
+    identity = owner(left)
+    return identity != 'unknown' and identity == owner(right)

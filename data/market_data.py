@@ -10,6 +10,7 @@ import os
 import time
 import json
 import threading
+import tempfile
 import asyncio
 import logging
 from collections import deque
@@ -19,10 +20,12 @@ import yfinance as yf
 from datetime import datetime, timedelta, time as dtime, date
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from loguru import logger
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
 from data.market_calendar import (
+    index_session_bounds,
     load_nse_calendar_coverage,
     load_nse_holidays,
     load_nse_special_trading_days,
@@ -286,10 +289,10 @@ class MarketDataProvider(KiteAngelMigration):
         totp_secret: str = "",
         start_streams: bool = True,
         allow_auth_refresh: bool = True,
+        upstox_only: Optional[bool] = None,
     ):
-        # Kite remains execution/data authority. AngelOne is an independent,
-        # read-only fallback for index prices and verified option quotes/OI/volume;
-        # it never owns orders and spot-index quotes remain volume-free.
+        # Live startup uses Upstox-only routing. Keep legacy adapters available to
+        # callers that explicitly request the compatibility route.
         self.api_key = api_key
         self.client_id = client_id
         self.password = password
@@ -317,7 +320,11 @@ class MarketDataProvider(KiteAngelMigration):
             _angel_client_id = client_id
             _angel_password = password
             _angel_totp = totp_secret
-        self.angel_index = AngelOneIndexQuoteSource(
+        if upstox_only is None:
+            route = str(getattr(_settings, "supplementary_market_data", "upstox") or "upstox")
+            upstox_only = route in {"upstox", "upstox_angel"}
+        self.upstox_only = upstox_only
+        self.angel_index = None if upstox_only else AngelOneIndexQuoteSource(
             api_key=_angel_api_key,
             client_id=_angel_client_id,
             password=_angel_password,
@@ -325,9 +332,14 @@ class MarketDataProvider(KiteAngelMigration):
         )
         self._angel_prewarm_lock = threading.Lock()
         from data.upstox_market_data import UpstoxMarketDataClient
-        self.upstox = UpstoxMarketDataClient()
+        self.upstox = UpstoxMarketDataClient(
+            timeout=float(getattr(_settings, "upstox_http_timeout_seconds", 7.0)))
+        self._upstox_stream = None
+        if upstox_only:
+            from data.upstox_stream import UpstoxStream
+            self._upstox_stream = UpstoxStream(self._receive_upstox_quote, self.upstox.timeout)
         self._angel_prewarm_started = False
-        self.kite = KiteDataSource(auth=None)
+        self.kite = None if upstox_only else KiteDataSource(auth=None)
         self.on_kite_reauth = None
         self._is_connected_override = None
         self.kws = None                       # KiteTicker
@@ -441,7 +453,9 @@ class MarketDataProvider(KiteAngelMigration):
         self._fyers_token_updated_at = None
         self.fyers: Optional[fyersModel.FyersModel] = None
         self._initialize_replacement(_settings)
-        if self._fyers_enabled():
+        if upstox_only:
+            self._market_data_route = "upstox"
+        if not upstox_only and self._fyers_enabled():
             self._load_fyers_token()
 
     def _angel_rest_backoff_config(self) -> Tuple[float, float]:
@@ -1125,6 +1139,9 @@ class MarketDataProvider(KiteAngelMigration):
         replacement socket while shutdown is in progress. This is used by audits and the
         application shutdown path; it never submits or changes an order.
         """
+        if getattr(self, "upstox_only", False):
+            self.start_streams = False
+            return self._upstox_stream.stop(timeout)
         self._fyers_ws_generation = getattr(self, "_fyers_ws_generation", 0) + 1
         self._fyers_ws_auth_failed = True
         self._fyers_ws_connected = False
@@ -1169,6 +1186,59 @@ class MarketDataProvider(KiteAngelMigration):
         self.kws = None
         return all(results.values())
 
+    def start_upstox_stream(self):
+        if getattr(self, "_upstox_stream", None) and self.start_streams:
+            self._upstox_stream.start()
+
+    def _receive_upstox_quote(self, key, quote):
+        from data.upstox_market_data import UPSTOX_INDEX_KEYS
+
+        received_at = quote["received_at"]
+        observed_at = quote["time"]
+        if not -1 <= received_at - observed_at <= 15:
+            return
+        self._ws_cache[key] = quote
+        index = next((symbol for symbol, instrument_key in UPSTOX_INDEX_KEYS.items()
+                      if key == instrument_key), "")
+        if index:
+            self._ws_cache[index] = quote
+            callback = getattr(self, "on_tick", None)
+            if index in INDEX_SPOT_TOKENS and callback and self.is_market_open():
+                timestamp = datetime.fromtimestamp(observed_at, ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+                callback(index, quote["ltp"], 0, timestamp, volume_source="unavailable")
+        else:
+            last_trade_at = quote["last_trade_at"]
+            previous = getattr(self, "_upstox_last_derivative_trade", None)
+            if previous is None:
+                previous = self._upstox_last_derivative_trade = {}
+            if -1 <= received_at - last_trade_at <= 15 and last_trade_at > previous.get(key, 0):
+                previous[key] = last_trade_at
+                if len(previous) > 256:
+                    previous.pop(min(previous, key=previous.get))
+                self._record_contract_tick(key, quote["ltp"], received_at, exchange_at=last_trade_at)
+            future = getattr(self, "_upstox_front_futures", {}).get(key)
+            if future is not None:
+                symbol, contract = future
+                self._record_index_futures_volume_snapshot(
+                    symbol, {"tradingsymbol": contract, "volume": quote.get("volume")},
+                    now_ts=observed_at)
+            else:
+                self._record_option_participation_tick(key, quote, received_at)
+
+    def _upstox_quote(self, key, max_age):
+        if not key:
+            return {}
+        if self._upstox_stream:
+            self._upstox_stream.watch(key)
+        now = time.time()
+        for row in (self._ws_cache.get(key), self._ltp_cache.get(key)):
+            if row and -1 <= now - row["time"] <= max_age:
+                return row
+        quote = self.upstox.get_quote(key)
+        if quote:
+            self._ltp_cache[key] = quote
+        return quote
+
     def enable_live_streams(self) -> bool:
         """Enable broker sockets after a runtime REPLAY -> live-mode switch.
 
@@ -1185,6 +1255,9 @@ class MarketDataProvider(KiteAngelMigration):
             return False
 
         self.start_streams = True
+        if getattr(self, "upstox_only", False):
+            self.start_upstox_stream()
+            return True
         self._prewarm_angelone_fallback()
         started = []
 
@@ -1818,19 +1891,22 @@ class MarketDataProvider(KiteAngelMigration):
         dt = dt or datetime.now()
         return dt.strftime("%Y-%m-%d") in self.nse_special_trading_days
 
+    @staticmethod
+    def get_index_session_bounds(dt: datetime) -> tuple[datetime, datetime]:
+        return index_session_bounds(dt)
+
     def is_market_open(self, dt: datetime = None) -> bool:
         """Robust check for NSE Market Status (09:15 - 15:30, Mon-Fri, No Holidays)"""
         dt = dt or datetime.now()
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(ZoneInfo("Asia/Kolkata"))
         special_session = self.is_special_trading_session(dt)
         # 1. Weekend check
         if dt.weekday() >= 5 and not special_session: return False
         # 2. Holiday check
         if self.is_market_holiday(dt) and not special_session: return False
-        # 3. Session time check (09:15 - 15:30)
-        curr_time = dt.time()
-        start_time = dtime(9, 15)
-        end_time = dtime(15, 30)
-        return start_time <= curr_time <= end_time
+        opening, closing = self.get_index_session_bounds(dt)
+        return opening <= dt <= closing
 
     def get_market_session_label(self, dt: datetime = None) -> str:
         """Return the display session for index quotes."""
@@ -1842,6 +1918,10 @@ class MarketDataProvider(KiteAngelMigration):
         preopen_start = self._clock_setting_time("real_mode_premarket_arm_start", "09:00:00")
         live_start = self._clock_setting_time("real_mode_live_start", "09:15:00")
         live_end = self._clock_setting_time("real_mode_live_end", "15:30:00")
+        if special_session:
+            opening, closing = self.get_index_session_bounds(dt)
+            if opening.time() != dtime(9, 15):
+                return "LIVE" if opening <= dt <= closing else "CLOSED"
         if preopen_start <= curr_time < live_start:
             return "PRE-OPEN"
         if live_start <= curr_time <= live_end:
@@ -1881,6 +1961,9 @@ class MarketDataProvider(KiteAngelMigration):
     def is_connected(self) -> bool:
         if getattr(self, "_is_connected_override", None) is not None:
             return bool(self._is_connected_override)
+        if getattr(self, "upstox_only", False):
+            from data.upstox_auth import get_upstox_token
+            return bool(get_upstox_token())
         upstox = getattr(self, "upstox", None)
         if upstox is not None and upstox.is_healthy():
             return True
@@ -1896,11 +1979,10 @@ class MarketDataProvider(KiteAngelMigration):
 
     @retry_on_exception(retries=3, delay=1.0)
     def connect(self) -> bool:
-        """Bind market data to Upstox primary session with Angel One fallback.
-
-        Primary execution and market data is Upstox API v2.
-        Angel One SmartAPI acts as the 30-second fallback if Upstox fails.
-        """
+        """Bind market data to the current Upstox session."""
+        if getattr(self, "upstox_only", False):
+            self.start_upstox_stream()
+            return self.is_connected
         try:
             from data.upstox_auth import get_upstox_auth
             auth = get_upstox_auth()
@@ -1928,7 +2010,7 @@ class MarketDataProvider(KiteAngelMigration):
 
     def _prewarm_angelone_fallback(self) -> bool:
         """Authenticate AngelOne off-loop once; Kite still owns all execution."""
-        if getattr(self, "_replacement_closed", False):
+        if getattr(self, "upstox_only", False) or getattr(self, "_replacement_closed", False):
             return False
         source = getattr(self, "angel_index", None)
         if source is None or not bool(getattr(source, "configured", False)):
@@ -2512,6 +2594,8 @@ class MarketDataProvider(KiteAngelMigration):
         working while quotes, ticks and contract lookups stay broken until a full
         restart — and the dashboard looks healthy throughout.
         """
+        if getattr(self, "upstox_only", False):
+            return
         from data.kite_auth import get_kite_auth
 
         self.kite = KiteDataSource(auth=get_kite_auth(), kite=kite)
@@ -2546,6 +2630,10 @@ class MarketDataProvider(KiteAngelMigration):
         replay them; before this the whole call was a silent no-op and option
         contracts were never streamed at all.
         """
+        if getattr(self, "upstox_only", False):
+            for token in tokens:
+                self._upstox_stream.watch(str(token))
+            return
         new_tokens = {
             str(token).strip() for token in tokens
             if str(token).strip().isdigit() and str(token).strip() not in self._active_kite_tokens
@@ -2618,13 +2706,23 @@ class MarketDataProvider(KiteAngelMigration):
             "healthy": upstox_healthy,
             "authenticated": bool(upstox_auth.get("authenticated")),
             "status": upstox_auth.get("status", "DISCONNECTED"),
-            "user_id": upstox_auth.get("user_id", "7JATYL"),
+            "user_id": upstox_auth.get("user_id", ""),
             "failure_seconds": round(upstox_client.failure_duration(), 1) if upstox_client is not None else 0.0,
         }
         health["upstox_healthy"] = upstox_healthy
         health["upstox_session_live"] = upstox_healthy
         health["upstox_auth"] = upstox_auth
-        if upstox_healthy:
+        if getattr(self, "upstox_only", False):
+            health["all_brokers_unavailable"] = not upstox_healthy
+            health["broker_degraded"] = not upstox_healthy
+            health["market_data_replacement"] = {
+                "route": "upstox", "source_priority": ["upstox"], "independent_broker_sources": 1,
+            }
+            broker = getattr(self, "execution_broker", None)
+            if broker is not None:
+                health["broker_status"] = broker.execution_status()
+            return health
+        elif upstox_healthy:
             health["all_brokers_unavailable"] = False
             health["broker_degraded"] = False
         remaining = max(
@@ -3453,6 +3551,22 @@ class MarketDataProvider(KiteAngelMigration):
         """Warm both exact CE/PE legs from the existing background chain refresh."""
         if not getattr(self, "start_streams", False) or chain is None or chain.empty:
             return
+        if getattr(self, "upstox_only", False):
+            from engine.expiry_manager import expiry_manager
+
+            frame = expiry_manager.df
+            if frame is None or not {"underlying_spot", "call_token", "put_token", "strike"}.issubset(chain):
+                return
+            spot = float(chain["underlying_spot"].median())
+            if not np.isfinite(spot) or spot <= 0:
+                return
+            strikes = chain.iloc[(chain["strike"] - spot).abs().argsort()[:7]]
+            wanted = set(strikes["call_token"]) | set(strikes["put_token"])
+            contracts = frame[(frame["name"] == instrument) & frame["token"].isin(wanted)]
+            for contract in contracts.to_dict("records"):
+                self._register_derivative_contract(instrument, contract)
+                self._upstox_stream.watch(contract["token"])
+            return
         kite = getattr(self, "kite", None)
         resolver = getattr(kite, "resolve_option", None)
         from intelligence.derivative_context import _expiry
@@ -3519,8 +3633,9 @@ class MarketDataProvider(KiteAngelMigration):
         if quantity is None or stamp is None or not 0 <= received_at-stamp <= 90:
             return
         instrument, contract, expiry, option_type, strike = identity
-        self._participation_store().observe(instrument, "options", "kite", contract,
-            stamp, quantity, oi=tick["oi"], price=tick.get("last_price", 0), clock="exchange",
+        provider = "upstox" if tick.get("source") == "upstox_ws" else "kite"
+        self._participation_store().observe(instrument, "options", provider, contract,
+            stamp, quantity, oi=tick["oi"], price=tick.get("ltp", tick.get("last_price", 0)), clock="exchange",
             expiry=expiry, option_type=option_type, strike=strike)
 
     def _record_index_futures_volume_snapshot(
@@ -3619,7 +3734,8 @@ class MarketDataProvider(KiteAngelMigration):
         empty = {
             "available": False,
             "reliable": False,
-            "source": "kite_index_futures_minute",
+            "source": ("upstox_index_futures_minute" if getattr(self, "upstox_only", False)
+                       else "kite_index_futures_minute"),
             "unit": "broker_reported_quantity",
             "tradingsymbol": "",
             "current_volume": 0.0,
@@ -3712,6 +3828,11 @@ class MarketDataProvider(KiteAngelMigration):
             "volume_comparable": False,
             "volume_unavailable_reason": "no_positive_cash_index_volume",
         }
+
+        if getattr(self, "upstox_only", False):
+            self._watch_upstox_futures()
+            result["futures"] = self.get_index_futures_minute_volume_context(symbol)
+            return result
 
         cached = (self._ws_cache or {}).get(FYERS_INDEX_SYMBOLS.get(symbol, ""), None)
         fyers_volume, fyers_age = 0.0, None
@@ -4090,7 +4211,10 @@ class MarketDataProvider(KiteAngelMigration):
                 if not isinstance(payload, dict):
                     continue
                 price = float(payload.get("ltp", 0.0) or 0.0)
-                cache_ts = self._cache_epoch(payload.get("time"))
+                upstox = getattr(self, "upstox_only", False)
+                if upstox and payload.get("source") not in {"upstox_ws", "upstox_rest"}:
+                    continue
+                cache_ts = self._cache_epoch(payload.get("last_trade_at") if upstox else payload.get("time"))
                 age = now_ts - cache_ts if cache_ts > 0 else float("inf")
                 if price > 0 and 0.0 <= age <= max_age:
                     self._last_ltp_time = cache_ts
@@ -4107,6 +4231,20 @@ class MarketDataProvider(KiteAngelMigration):
                 return float(val.get('ltp', 0.0) or 0.0)
             self._last_ltp_time = time.time()
             return val
+
+        if getattr(self, "upstox_only", False):
+            from data.upstox_market_data import UPSTOX_INDEX_KEYS
+            key = str(token or "")
+            if not key.startswith(("NSE_FO|", "BSE_FO|")):
+                key = UPSTOX_INDEX_KEYS.get(symbol, key)
+            quote = self._upstox_quote(key if "|" in key else "", 2.0)
+            max_age = 10.0 if self.is_market_open() else 86400.0
+            mark_time = (quote.get("last_trade_at") if key.startswith(("NSE_FO|", "BSE_FO|"))
+                         else quote.get("time"))
+            if mark_time and -1 <= time.time() - mark_time <= max_age:
+                self._last_ltp_time = mark_time
+                return quote["ltp"]
+            return 0.0
 
         if symbol == "INDIAVIX":
             upstox_client = getattr(self, "upstox", None)
@@ -4485,6 +4623,30 @@ class MarketDataProvider(KiteAngelMigration):
         if name not in INDEX_SPOT_TOKENS:
             return base
 
+        if getattr(self, "upstox_only", False):
+            from data.upstox_market_data import UPSTOX_INDEX_KEYS
+            key = UPSTOX_INDEX_KEYS.get(name)
+            rows = [row for row in (self._ws_cache.get(key), self._ltp_cache.get(key))
+                    if row and row["time"] <= now]
+            if not rows:
+                return base
+            row = max(rows, key=lambda item: item["time"])
+            price, previous = row["ltp"], float(row.get("previous_close") or 0)
+            change = price - previous if previous > 0 else 0
+            age = now - row["time"]
+            fresh = age <= 5 and session_label == "LIVE"
+            source = row["source"]
+            base.update(ltp=price, spot_price=price, change=change, change_points=change,
+                        change_pct=100 * change / previous if previous > 0 else 0,
+                        previous_close=previous, prev_close=previous, source=source, quote_source=source,
+                        is_fresh=fresh, is_stale=not fresh, quote_fresh=fresh, quote_stale=not fresh,
+                        freshness="fresh" if fresh else "stale", source_role="primary",
+                        selected_price_source=source, candle_price_source="upstox_ws",
+                        quote_age_seconds=age, received_at=row["received_at"],
+                        received_at_epoch=row["received_at"], exchange_at=row["time"],
+                        exchange_timestamp_epoch=row["time"], freshness_basis="provider")
+            return base
+
         token = INDEX_SPOT_TOKENS.get(name, ("", ""))[0]
         broker_keys = self._index_broker_cache_keys(name, token)
         fyers_keys = (FYERS_INDEX_SYMBOLS.get(name, ""),)
@@ -4659,6 +4821,21 @@ class MarketDataProvider(KiteAngelMigration):
             "session": session_label,
             "is_preopen": session_label == "PRE-OPEN"
         }
+        if getattr(self, "upstox_only", False):
+            from data.upstox_market_data import UPSTOX_INDEX_KEYS
+            row = self._upstox_quote(UPSTOX_INDEX_KEYS.get(symbol), 2.0)
+            if row:
+                age = time.time() - row["time"]
+                previous = float(row.get("previous_close") or 0.0)
+                price = row["ltp"]
+                change = price - previous if previous > 0 else 0.0
+                fresh = -1 <= age <= 5
+                quote.update(row, previous_close=previous, change=change,
+                             change_pct=(100 * change / previous if previous > 0 else 0.0),
+                             quote_age_seconds=max(0.0, age), is_fresh=fresh, is_stale=not fresh,
+                             exchange_at=row["time"])
+            return quote
+
         if symbol not in INDEX_SPOT_TOKENS:
             return quote
 
@@ -4963,6 +5140,14 @@ class MarketDataProvider(KiteAngelMigration):
         execution layer to choose or shadow a marketable-limit cap.
         """
         now_ts = time.time()
+        if getattr(self, "upstox_only", False):
+            key = str(token or "")
+            if not key.startswith(("NSE_FO|", "BSE_FO|")):
+                return {"usable": False, "reason": "unverified_upstox_instrument"}
+            quote = self._upstox_quote(key, max_age_seconds)
+            now_ts = time.time()
+            return self._touch_quote_from_payload(quote, str(quote.get("source") or "upstox"),
+                                                  now_ts, max_age_seconds)
         cache_key = f"{exchange}|{symbol}|{token}"
         cached = self._touch_quote_cache.get(cache_key)
         if isinstance(cached, dict):
@@ -5291,6 +5476,28 @@ class MarketDataProvider(KiteAngelMigration):
 
     def get_previous_close(self, symbol: str) -> float:
         """Fetch official closing price with persistent session caching"""
+        if getattr(self, "upstox_only", False):
+            from data.upstox_market_data import UPSTOX_INDEX_KEYS
+
+            key = UPSTOX_INDEX_KEYS.get(symbol)
+            if not key:
+                return 0.0
+            ist = ZoneInfo("Asia/Kolkata")
+            today = datetime.now(ist).date()
+            cached_at = (getattr(self, "_prev_close_cache_time", {}) or {}).get(symbol, 0)
+            if (cached_at and datetime.fromtimestamp(cached_at, ist).date() == today
+                    and str((getattr(self, "_prev_close_cache_source", {}) or {}).get(symbol, "")).startswith("upstox")):
+                return self.get_cached_previous_close(symbol)
+            row = self._upstox_quote(key, 300.0)
+            close = float(row.get("previous_close") or 0.0)
+            if np.isfinite(close) and close > 0:
+                return self._remember_previous_close(symbol, close, "upstox_quote")
+            candles = self.upstox.get_historical_candles(key, "day", 7, to_date=today - timedelta(days=1))
+            if candles:
+                close = float(candles[-1][4] or 0.0)
+                if np.isfinite(close) and close > 0:
+                    return self._remember_previous_close(symbol, close, "upstox_daily")
+            return 0.0
         if self._fyers_backup_enabled():
             existing_source = (getattr(self, "_prev_close_cache_source", {}) or {}).get(symbol, "")
             existing_age = time.time() - (getattr(self, "_prev_close_cache_time", {}) or {}).get(symbol, 0)
@@ -5685,7 +5892,8 @@ class MarketDataProvider(KiteAngelMigration):
         # Historical option candles are heavily reused during backtests. Prefer the
         # local per-symbol CSV cache before touching broker APIs to avoid rate-limit
         # stalls and session-token noise for expired option contracts.
-        is_option_symbol = bool(instrument_name) and str(instrument_name).upper().endswith(("CE", "PE"))
+        is_option_symbol = bool(instrument_name) and (str(instrument_name).upper().endswith(("CE", "PE"))
+            or any(part in {"CE", "PE"} for part in str(instrument_name).upper().split()))
         if not force_refresh and is_option_symbol and cache_file.exists():
             try:
                 cached_df = get_option_history_store().load(cache_file)
@@ -5696,6 +5904,37 @@ class MarketDataProvider(KiteAngelMigration):
                     return cached_df
             except Exception as exc:
                 logger.debug(f"Option history cache read failed for {instrument_name}: {exc}")
+
+        if getattr(self, "upstox_only", False):
+            from data.upstox_market_data import UPSTOX_INDEX_KEYS
+            key = UPSTOX_INDEX_KEYS.get(str(instrument_name).upper(), str(token or ""))
+            rows = self.upstox.get_historical_candles(key, interval, days_back, to_date=to_date)
+            if not rows:
+                return pd.DataFrame()
+            df = pd.DataFrame([row[:7] for row in rows],
+                              columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+            df["timestamp"] = (pd.to_datetime(df["timestamp"], utc=True)
+                               .dt.tz_convert("Asia/Kolkata").dt.tz_localize(None))
+            df = df.set_index("timestamp").sort_index()
+            df = df.loc[~df.index.duplicated(keep="last")]
+            df["price_source"] = "upstox_history"
+            if "_INDEX|" in key:
+                if str(interval).lower() in {"1min", "1m", "1minute"}:
+                    requested_at = pd.Timestamp.fromtimestamp(now, tz="Asia/Kolkata").tz_localize(None)
+                    df = df.loc[df.index + pd.Timedelta(minutes=1) <= requested_at]
+                    if df.empty:
+                        return df
+                df["volume"] = 0.0
+                df["volume_source"] = "unavailable"
+            else:
+                df["volume_source"] = "upstox_derivative"
+            if persist_cache:
+                merged = self._save_and_merge_candles(df, cache_file)
+                if merged is not None and days_back != 0:
+                    df = merged
+            self._api_hist_cache[cache_key] = df
+            self._last_api_hist_fetch[cache_key] = now
+            return df
 
         # 0b. THE ONLY LIVE HISTORY SOURCE FOR AN OPTION CONTRACT.
         # Everything below this point that could fetch a CE/PE goes through
@@ -6116,7 +6355,13 @@ class MarketDataProvider(KiteAngelMigration):
             logger.debug(f"Yahoo volume preservation skipped for {instrument_name}: {exc}")
         return out
 
+    _candle_cache_write_lock = threading.RLock()
+
     def _save_and_merge_candles(self, df: pd.DataFrame, cache_file: Path):
+        with self._candle_cache_write_lock:
+            return self._merge_candle_cache(df, cache_file)
+
+    def _merge_candle_cache(self, df: pd.DataFrame, cache_file: Path):
         """Merge new candles with existing cache to prevent data loss and fill gaps"""
         if df.empty:
             return
@@ -6141,9 +6386,12 @@ class MarketDataProvider(KiteAngelMigration):
 
         try:
             if cache_file.exists():
-                existing_df = self._naive_kolkata_index(
-                    pd.read_csv(cache_file, index_col=0, parse_dates=True)
-                )
+                try:
+                    existing_df = self._naive_kolkata_index(
+                        pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                    )
+                except pd.errors.EmptyDataError:
+                    existing_df = pd.DataFrame()
                 if not existing_df.empty:
                     for frame in (existing_df, df):
                         frame.columns = [c.lower() for c in frame.columns]
@@ -6156,6 +6404,7 @@ class MarketDataProvider(KiteAngelMigration):
                         preserve_idx = [
                             idx for idx in shared_idx
                             if new_vol.get(idx, 0) <= 0 and existing_vol.get(idx, 0) > 0
+                            and not getattr(self, "upstox_only", False)
                         ]
                         if preserve_idx:
                             df.loc[preserve_idx, "volume"] = existing_vol.loc[preserve_idx]
@@ -6175,7 +6424,7 @@ class MarketDataProvider(KiteAngelMigration):
                         merged_df = merged_df.iloc[start:]
                     material_cols = [
                         'open', 'high', 'low', 'close', 'volume', 'tick_count',
-                        'volume_basis', 'source', 'provider_time',
+                        'volume_basis', 'source', 'provider_time', 'price_source',
                     ]
                     compare_cols = [
                         c for c in material_cols
@@ -6186,12 +6435,13 @@ class MarketDataProvider(KiteAngelMigration):
                         for c in ('tick_count', 'volume_basis', 'source', 'provider_time', 'receipt_at')
                         if c in merged_df.columns
                     )
+                    touched = df.index.intersection(merged_df.index)
                     if (
                         compare_cols
                         and telemetry_schema_unchanged
                         and len(merged_df) == len(existing_df)
                         and len(merged_df.index.difference(existing_df.index)) == 0
-                        and existing_df[compare_cols].tail(3).equals(merged_df[compare_cols].tail(3))
+                        and existing_df.loc[touched, compare_cols].equals(merged_df.loc[touched, compare_cols])
                     ):
                         logger.debug(f"Skipping unchanged candle cache write for {cache_file.name}")
                         # The in-memory response still carries this request's exact
@@ -6201,17 +6451,17 @@ class MarketDataProvider(KiteAngelMigration):
                     df = merged_df
                     
             # Save the full merged dataset
-            df.to_csv(cache_file)
+            with tempfile.NamedTemporaryFile(dir=cache_file.parent, suffix=".tmp", delete=False) as temporary:
+                staged = Path(temporary.name)
+            try:
+                df.to_csv(staged)
+                staged.replace(cache_file)
+            finally:
+                staged.unlink(missing_ok=True)
             get_option_history_store().invalidate(cache_file)
             logger.info(f"💾 Merged and saved data to {cache_file.name} (Total candles: {len(df)})")
         except Exception as e:
             logger.error(f"❌ Failed to merge/save candles to {cache_file.name}: {e}")
-            # Fallback to just saving the new data
-            try:
-                df.to_csv(cache_file)
-                get_option_history_store().invalidate(cache_file)
-            except Exception as fallback_exc:
-                logger.warning(f"Fallback candle save failed for {cache_file.name}: {fallback_exc}")
         return df
 
     def chain_matches_execution_expiry(self, index_symbol, chain):
@@ -6221,7 +6471,7 @@ class MarketDataProvider(KiteAngelMigration):
         key = "active_monthly" if index_symbol in {"BANKNIFTY", "MIDCPNIFTY"} else "active_weekly"
         expected = expiry_manager.effective_expiry(index_symbol, key)
         if not actual or not expected:
-            return True  # Legacy callers; live provider results always carry expiry.
+            return not getattr(self, "upstox_only", False)
         actual_date = pd.to_datetime(actual, errors="coerce")
         expected_date = pd.to_datetime(expected, errors="coerce")
         return bool(pd.notna(actual_date) and pd.notna(expected_date) and actual_date.date() == expected_date.date())
@@ -6240,13 +6490,15 @@ class MarketDataProvider(KiteAngelMigration):
         if not self.chain_matches_execution_expiry(index_symbol, cached):
             return None
         allowed = {"fyers", "kite", "angelone"} if self._replacement_enabled() else {"fyers"}
+        if getattr(self, "upstox_only", False):
+            allowed = {"upstox"}
         if str(meta.get("source") or "").lower() not in allowed or not bool(meta.get("expiry_aligned", False)):
             return None
         fetched_at = float(meta.get("fetched_at") or 0.0)
         age = time.time() - fetched_at if fetched_at > 0 else float("inf")
         if not (0.0 <= age <= max(0.0, float(max_age_seconds or 0.0))):
             return None
-        if self._replacement_enabled() and str(meta.get("source")) != "fyers":
+        if self._replacement_enabled() and str(meta.get("source")) not in {"fyers", "upstox"}:
             clocks = [self._replacement_epoch(value) for column in ("call_quote_at", "put_quote_at")
                       for value in cached.get(column, pd.Series([None] * len(cached))).tolist()]
             if not clocks or any(stamp is None or not 0 <= time.time()-stamp <= max_age_seconds for stamp in clocks):
@@ -6376,46 +6628,68 @@ class MarketDataProvider(KiteAngelMigration):
         return chain
 
     def get_option_chain(self, index_symbol: str, exchange: str = "NFO") -> Optional[pd.DataFrame]:
-        """Fetch Upstox option chain natively with Greeks, IV, PCR, volume; 30s Angel One fallback."""
+        """Fetch a chain for the same active expiry used to select execution contracts."""
         now = time.time()
         cache_key = f"opt_chain_{index_symbol}"
         if not hasattr(self, "_opt_chain_cache"): self._opt_chain_cache = {}
         if not hasattr(self, "_last_opt_chain_fetch"): self._last_opt_chain_fetch = {}
 
         cached_chain = self._opt_chain_cache.get(cache_key)
-        if cached_chain is not None and not self.chain_matches_execution_expiry(index_symbol, cached_chain):
-            self._opt_chain_cache.pop(cache_key, None)
-            self._last_opt_chain_fetch.pop(cache_key, None)
-
+        from engine.expiry_manager import expiry_manager
         from config.settings import get_settings
-        chain_ttl = max(10.0, float(getattr(get_settings(), "intelligence_cache_ttl_seconds", 30.0)))
-
-        # Cache check
-        last_fetch = self._last_opt_chain_fetch.get(cache_key, 0)
-        if now - last_fetch < chain_ttl and cached_chain is not None and not cached_chain.empty:
+        expiry_type = "active_monthly" if index_symbol in {"BANKNIFTY", "MIDCPNIFTY"} else "active_weekly"
+        active = expiry_manager.effective_expiry(index_symbol, expiry_type)
+        if not active:
+            return pd.DataFrame()
+        expiry = pd.to_datetime(active).date().isoformat()
+        ttl = max(10.0, float(getattr(get_settings(), "intelligence_cache_ttl_seconds", 30.0)))
+        last_fetch = self._last_opt_chain_fetch.get(cache_key, 0.0)
+        if (cached_chain is not None and cached_chain.attrs.get("expiry") == expiry
+                and 0 <= now - last_fetch < ttl):
             return cached_chain
 
-        # 1. Primary: Upstox option chain
-        upstox_client = getattr(self, "upstox", None)
-        if upstox_client is not None and (upstox_client.is_healthy(threshold_seconds=30.0) or upstox_client.failure_duration() < 30.0):
-            try:
-                chain = upstox_client.get_option_chain_df(index_symbol)
-                if chain is not None and not chain.empty:
-                    self._opt_chain_cache[cache_key] = chain
-                    self._last_opt_chain_fetch[cache_key] = now
-                    return chain
-            except Exception as exc:
-                logger.warning(f"Upstox option chain fetch failed for {index_symbol}: {exc}")
+        client = getattr(self, "upstox", None)
+        chain = client.get_option_chain_df(index_symbol, expiry) if client is not None else None
+        if chain is None or chain.empty or chain.attrs.get("expiry") != expiry:
+            return pd.DataFrame()
+        observed = time.time()
+        meta = {"source": "upstox", "oi_provider": "upstox", "fetched_at": observed,
+                "active_expiry": expiry, "expiry_aligned": True, "fallback": False,
+                "strike_count": len(chain), "exchange_clocks_fresh": False,
+                "volume_complete": bool(chain[["call_volume_available", "put_volume_available"]].all().all())}
+        chain.attrs.update(meta)
+        self._opt_chain_cache[cache_key] = chain
+        self._last_opt_chain_fetch[cache_key] = observed
+        self._option_chain_meta[index_symbol] = meta
+        self._archive_option_chain(index_symbol, chain, observed, meta)
+        return chain
 
-        # 2. Fallback: cached option chain if Upstox fails > 30s
-        if cached_chain is not None and not cached_chain.empty:
-            logger.info(f"Using cached option chain fallback for {index_symbol}")
-            return cached_chain
-        return pd.DataFrame()
+    def _watch_upstox_futures(self):
+        from engine.expiry_manager import expiry_manager
+        if not self._upstox_stream or not self.start_streams:
+            return
+        front = {str(row.get("current_fut_token")): (name, str(row.get("current_fut") or row["current_fut_token"]))
+                 for name, row in expiry_manager.expiries.items() if row.get("current_fut_token")}
+        self._upstox_front_futures = front
+        for key in front:
+            self._upstox_stream.watch(key)
 
     def fetch_instruments(self):
         from engine.expiry_manager import expiry_manager
-        return expiry_manager.pre_market_check()
+        expiries = expiry_manager.pre_market_check()
+        if getattr(self, "upstox_only", False):
+            self._watch_upstox_futures()
+        return expiries
+
+    def get_token_for_symbol(self, symbol: str) -> str:
+        """Resolve the exact current Upstox symbol for an archive or quote lookup."""
+        from engine.expiry_manager import expiry_manager
+
+        frame = expiry_manager.df
+        if not getattr(self, "upstox_only", False) or frame is None:
+            return ""
+        matches = frame.loc[frame["symbol"].eq(symbol), "token"]
+        return str(matches.iloc[0]) if len(matches) == 1 else ""
 
     def get_option_token(self, name: str, strike: float, option_type: str, trade_date: Optional[date] = None, now_dt=None) -> Optional[Dict]:
         from engine.expiry_manager import expiry_manager

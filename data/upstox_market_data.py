@@ -5,12 +5,13 @@ historical candles, and failure tracking for the 30-second Angel One fallback.
 """
 from __future__ import annotations
 
-import json
+import math
 import threading
 import time
 import urllib.parse
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 from loguru import logger
@@ -32,7 +33,7 @@ UPSTOX_KEY_TO_INDEX = {v: k for k, v in UPSTOX_INDEX_KEYS.items()}
 
 UPSTOX_BASE_URL = "https://api.upstox.com"
 UPSTOX_LTP_URL = f"{UPSTOX_BASE_URL}/v2/market-quote/ltp"
-UPSTOX_QUOTES_URL = f"{UPSTOX_BASE_URL}/v2/market-quote/quotes"
+UPSTOX_QUOTES_URL = f"{UPSTOX_BASE_URL}/v3/market-quote/quotes"
 UPSTOX_OPTION_CONTRACT_URL = f"{UPSTOX_BASE_URL}/v2/option/contract"
 UPSTOX_OPTION_CHAIN_URL = f"{UPSTOX_BASE_URL}/v2/option/chain"
 UPSTOX_INTRADAY_CANDLE_URL = f"{UPSTOX_BASE_URL}/v3/historical-candle/intraday/{{key}}/{{unit}}/{{interval}}"
@@ -124,47 +125,53 @@ class UpstoxMarketDataClient:
             logger.warning(f"Upstox index LTP fetch failed for {index_name}: {e}")
         return None
 
-    def get_multi_index_quotes(self, indices: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
-        """Fetch quotes for all or selected indices simultaneously."""
-        targets = indices or list(UPSTOX_INDEX_KEYS.keys())
-        keys = [UPSTOX_INDEX_KEYS[idx.upper()] for idx in targets if idx.upper() in UPSTOX_INDEX_KEYS]
-        if not keys:
-            return {}
-
-        url = f"{UPSTOX_QUOTES_URL}?instrument_key={','.join(keys)}"
+    def get_quote(self, instrument_key: str) -> Dict[str, Any]:
+        """Return a quote for the exact requested key and its provider clock."""
         try:
-            resp = requests.get(url, headers=self._headers(), timeout=self.timeout)
-            if resp.status_code == 200:
-                payload = resp.json().get("data", {})
-                result = {}
-                for instrument_key, quote in payload.items():
-                    norm_k = instrument_key.replace(':', '|').upper()
-                    for idx_name, idx_key in UPSTOX_INDEX_KEYS.items():
-                        if idx_key.upper() in norm_k or norm_k in idx_key.upper():
-                            ohlc = quote.get("ohlc", {})
-                            result[idx_name] = {
-                                "symbol": idx_name,
-                                "instrument_key": idx_key,
-                                "ltp": float(quote.get("last_price") or ohlc.get("close") or 0.0),
-                                "open": float(ohlc.get("open") or 0.0),
-                                "high": float(ohlc.get("high") or 0.0),
-                                "low": float(ohlc.get("low") or 0.0),
-                                "close": float(ohlc.get("close") or 0.0),
-                                "volume": float(quote.get("volume") or 0.0),
-                                "timestamp": time.time(),
-                                "source": "upstox",
-                            }
-                            self._quote_cache[idx_name] = result[idx_name]
-                if result:
-                    self._record_success()
-                    return result
-            self._record_failure(f"HTTP {resp.status_code}: {resp.text[:100]}")
-        except Exception as e:
-            self._record_failure(e)
-            logger.warning(f"Upstox multi-index quotes failed: {e}")
+            response = requests.get(UPSTOX_QUOTES_URL, params={"instrument_key": instrument_key},
+                                    headers=self._headers(), timeout=self.timeout)
+            response.raise_for_status()
+            body = response.json()
+            for label, quote in (body.get("data") or {}).items():
+                if quote.get("instrument_token", label.replace(":", "|", 1)) != instrument_key:
+                    continue
+                clock = datetime.fromisoformat(quote["timestamp"])
+                if clock.tzinfo is None:
+                    return {}
+                bid = next(iter((quote.get("depth") or {}).get("buy") or []), {})
+                ask = next(iter((quote.get("depth") or {}).get("sell") or []), {})
+                ltp = float(quote.get("last_price") or 0)
+                if not math.isfinite(ltp) or ltp <= 0:
+                    return {}
+                close = float(quote.get("prev_close_price") or 0)
+                if close <= 0 and quote.get("net_change") is not None:
+                    close = ltp - float(quote["net_change"])
+                result = {
+                    "ltp": ltp, "time": clock.timestamp(), "last_update": clock.timestamp(),
+                    "received_at": time.time(), "depth": quote.get("depth"),
+                    "source": "upstox_rest",
+                    "previous_close": close if math.isfinite(close) and close > 0 else 0.0,
+                    "last_trade_at": float(quote.get("last_trade_time") or 0) / 1000,
+                }
+                for field, value in (("bid", bid.get("price")), ("ask", ask.get("price")),
+                                     ("bid_qty", bid.get("quantity")), ("ask_qty", ask.get("quantity")),
+                                     ("oi", quote.get("oi")), ("volume", quote.get("volume"))):
+                    if value is not None:
+                        result[field] = value
+                self._record_success()
+                return result
+        except (ValueError, KeyError, TypeError, AttributeError, requests.RequestException) as exc:
+            self._record_failure(exc)
+        return {}
 
-        # Return cached if within 5 seconds
-        return {k: v for k, v in self._quote_cache.items() if time.time() - v.get("timestamp", 0) < 5.0}
+    def get_multi_index_quotes(self, indices: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        quotes = {}
+        for name in indices or dict.fromkeys(UPSTOX_INDEX_KEYS):
+            key = UPSTOX_INDEX_KEYS.get(name.upper())
+            if key and (quote := self.get_quote(key)):
+                quotes[name.upper()] = {**quote, "symbol": name.upper(), "instrument_key": key,
+                                       "timestamp": quote["time"]}
+        return quotes
 
     def get_option_contracts(self, index_name: str) -> List[Dict[str, Any]]:
         """Fetch and cache available option contracts for an index."""
@@ -235,8 +242,7 @@ class UpstoxMarketDataClient:
             self._record_failure(e)
             logger.warning(f"Upstox option chain fetch failed for {index_name} ({expiry}): {e}")
 
-        cached = self._chain_cache.get(cache_key)
-        return cached[1] if cached else []
+        return []
 
     def get_option_premium_and_greeks(
         self,
@@ -292,66 +298,46 @@ class UpstoxMarketDataClient:
         }
 
     def get_historical_candles(
-        self,
-        index_name: str,
-        interval: str = "5minute",
-        days: int = 5
+        self, index_name: str, interval: str = "5minute", days: int = 5, *, to_date=None,
     ) -> List[List[Any]]:
-        """Fetch historical candles via Upstox v3 API.
-
-        interval can be: '1minute', '5minute', '15minute', '30minute', 'day'
-        """
-        key = UPSTOX_INDEX_KEYS.get(index_name.upper())
-        if not key:
+        """Use dated history for prior sessions and intraday candles for today."""
+        key = UPSTOX_INDEX_KEYS.get(index_name.upper(), index_name)
+        intervals = {"day": ("days", "1"), "1d": ("days", "1"), "daily": ("days", "1")}
+        for minutes in (1, 3, 5, 10, 15, 30, 60):
+            for suffix in ("m", "min", "minute"):
+                intervals[f"{minutes}{suffix}"] = ("minutes", str(minutes))
+        if "|" not in key or interval.lower() not in intervals:
             return []
-
-        # Map interval to v3 format (unit, interval_num)
-        unit = "minutes"
-        interval_val = "5"
-        if interval in ("1minute", "1m"):
-            interval_val = "1"
-        elif interval in ("5minute", "5m"):
-            interval_val = "5"
-        elif interval in ("15minute", "15m"):
-            interval_val = "15"
-        elif interval in ("30minute", "30m"):
-            interval_val = "30"
-        elif interval in ("day", "1d"):
-            unit = "days"
-            interval_val = "1"
-
+        unit, count = intervals[interval.lower()]
         quoted_key = urllib.parse.quote(key, safe="")
-        # Try intraday endpoint first
-        url_intraday = UPSTOX_INTRADAY_CANDLE_URL.format(key=quoted_key, unit=unit, interval=interval_val)
-        try:
-            resp = requests.get(url_intraday, headers=self._headers(), timeout=self.timeout)
-            if resp.status_code == 200:
-                candles = (resp.json().get("data") or {}).get("candles", [])
-                if candles:
-                    self._record_success()
-                    return candles
-        except Exception as e:
-            logger.debug(f"Upstox intraday candle fetch error: {e}")
-
-        # Fallback to date-range historical v3
-        today = datetime.now()
-        frm = (today - timedelta(days=days)).strftime("%Y-%m-%d")
-        to = today.strftime("%Y-%m-%d")
-        url_hist = UPSTOX_HIST_CANDLE_URL.format(
-            key=quoted_key, unit=unit, interval=interval_val, to=to, frm=frm
-        )
-        try:
-            resp = requests.get(url_hist, headers=self._headers(), timeout=self.timeout)
-            if resp.status_code == 200:
-                candles = (resp.json().get("data") or {}).get("candles", [])
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        end = to_date.date() if isinstance(to_date, datetime) else to_date or today
+        start = end - timedelta(days=max(0, int(days)))
+        history_end = min(end, today - timedelta(days=1))
+        candles = {}
+        urls = []
+        window_days = (28 if unit == "minutes" and int(count) <= 15 else
+                       85 if unit == "minutes" else 3650)
+        while history_end >= start:
+            window_start = max(start, history_end - timedelta(days=window_days - 1))
+            urls.append(UPSTOX_HIST_CANDLE_URL.format(
+                key=quoted_key, unit=unit, interval=count, to=history_end.isoformat(), frm=window_start.isoformat()))
+            history_end = window_start - timedelta(days=1)
+        if end == today:
+            urls.append(UPSTOX_INTRADAY_CANDLE_URL.format(key=quoted_key, unit=unit, interval=count))
+        for url in urls:
+            try:
+                response = requests.get(url, headers=self._headers(), timeout=self.timeout)
+                response.raise_for_status()
+                for candle in (response.json().get("data") or {}).get("candles", []):
+                    if isinstance(candle, list) and len(candle) >= 7:
+                        candles[candle[0]] = candle
                 self._record_success()
-                return candles
-            self._record_failure(f"HTTP {resp.status_code}: {resp.text[:100]}")
-        except Exception as e:
-            self._record_failure(e)
-            logger.warning(f"Upstox historical candles failed for {index_name}: {e}")
-
-        return []
+            except (ValueError, requests.RequestException) as exc:
+                self._record_failure(exc)
+                if "/intraday/" not in url:
+                    return []
+        return [candles[stamp] for stamp in sorted(candles)]
 
     def get_option_chain_df(self, index_name: str, expiry_date: Optional[str] = None) -> Optional[Any]:
         """Convert Upstox option chain into standardized pandas DataFrame."""
@@ -363,6 +349,8 @@ class UpstoxMarketDataClient:
             return None
         rows = []
         for item in raw_chain:
+            if expiry_date and item.get("expiry") != expiry_date:
+                continue
             strike = float(item.get("strike_price") or 0.0)
             c = item.get("call_options") or {}
             p = item.get("put_options") or {}
@@ -378,12 +366,16 @@ class UpstoxMarketDataClient:
 
             rows.append({
                 "strike": strike,
+                "call_token": str(c.get("instrument_key") or ""),
+                "put_token": str(p.get("instrument_key") or ""),
                 "call_ltp": float(c_mkt.get("ltp") or 0.0),
                 "put_ltp": float(p_mkt.get("ltp") or 0.0),
                 "call_oi": c_oi,
                 "put_oi": p_oi,
                 "call_oi_change": c_oi - c_prev_oi,
                 "put_oi_change": p_oi - p_prev_oi,
+                "call_volume_available": c_mkt.get("volume") is not None,
+                "put_volume_available": p_mkt.get("volume") is not None,
                 "call_volume": float(c_mkt.get("volume") or 0.0),
                 "put_volume": float(p_mkt.get("volume") or 0.0),
                 "call_iv": float(c_grk.get("iv") or 0.0),
@@ -403,11 +395,13 @@ class UpstoxMarketDataClient:
                 "pcr": float(item.get("pcr") or 0.0),
                 "underlying_spot": float(item.get("underlying_spot_price") or 0.0),
             })
+        if not rows:
+            return None
         df = pd.DataFrame(rows)
         df.sort_values(by="strike", inplace=True)
         df.reset_index(drop=True, inplace=True)
         df.attrs["source"] = "upstox"
         df.attrs["provider"] = "upstox"
-        df.attrs["auto_certified"] = True
+        df.attrs["expiry"] = expiry_date or str(raw_chain[0].get("expiry") or "")
         return df
 

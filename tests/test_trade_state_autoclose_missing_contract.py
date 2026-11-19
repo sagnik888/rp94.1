@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from data.sqlite_db import db
+from data.sqlite_db import DatabaseManager, db
 from trading.trade_manager import IST, TradeManager
 
 # The auto-close applies to SAME-SESSION rows only: a trade that survived a day
@@ -72,3 +72,33 @@ def test_load_state_closes_open_trade_missing_contract_metadata(monkeypatch):
 
     assert manager.open_trades == {}
     assert any(t.id == "T9999_MISSING_07311234" and t.status == "CLOSED" for t in manager.closed_trades)
+
+
+def test_load_state_restores_live_row_and_preserves_unlisted_replay_for_audit(monkeypatch):
+    import threading
+
+    broker_symbol = "BANKNIFTY 61000 PE 29 DEC 26"
+    active = {
+        "id": "T9876_TEST", "instrument": "BANKNIFTY", "timeframe": "5min",
+        "direction": "SHORT", "entry_price": 100.0, "entry_timestamp": _TODAY.timestamp(),
+        "entry_time": _TODAY.strftime("%d %b %H:%M:%S"),
+        "trading_symbol": broker_symbol, "symbol_token": "NSE_FO|9876",
+        "data_provenance": "LIVE", "broker_order_id": "owned-order",
+        "broker_quantity": 30, "lot_size": 30, "lots": 1, "inst_type": "OPT",
+        "status": "OPEN",
+    }
+    replay = dict(active, id="H_OLD_REPLAY", trading_symbol="BANKNIFTY OLD PE",
+                  data_provenance="ENGINE_REPLAY", broker_order_id="", broker_quantity=0)
+    monkeypatch.setattr(DatabaseManager, "_tradable_symbols", classmethod(lambda cls: {"OTHER"}))
+    monkeypatch.setattr(db, "load_open_trades", lambda: [replay, active])
+    monkeypatch.setattr(db, "load_closed_trades", lambda: [])
+    manager = TradeManager.__new__(TradeManager)
+    manager._lock = threading.RLock()
+    manager.open_trades = {}
+    manager.closed_trades = []
+    manager._trade_counter = 0
+
+    manager.load_state()
+    assert manager._trade_state_loaded
+    assert list(manager.open_trades) == [active["id"]]
+    assert list(manager._restored_replay_open_rows) == [replay["id"]]

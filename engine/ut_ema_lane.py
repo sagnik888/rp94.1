@@ -242,6 +242,10 @@ def entry_consumed(scanner, instrument, identity):
 
 def result_for_monitor(scanner, trade):
     """Keep the original native event source available after scanner selection changes."""
+    service = getattr(scanner, "_utema_tick_service", None)
+    if service is not None and str(getattr(scanner, "mode", "")).upper() == "REAL":
+        item = state(trade)
+        return service.monitor_owner(trade, item.get("lifecycle_id"), item.get("entry_time"))
     mtf = getattr(scanner, "mtf", None)
     key = f"{trade.instrument}_{trade.timeframe}"
     adapter = (getattr(mtf, "engines", {}) or {}).get(key)
@@ -613,14 +617,24 @@ def analysis_view(scanner, instrument, configuration, mtf_result, spot, lots, lo
     settings = get_settings()
     rows = scanner._get_session_trade_candidates(instrument)
     scanner._refresh_trade_candidates(rows, configuration, allow_blocking=False)
-    if str(getattr(scanner, "mode", "")).upper() != "HISTORICAL":
+    historical = str(getattr(scanner, "mode", "")).upper() == "HISTORICAL"
+    if not historical:
         scanner._check_session_candidates_breaches(instrument)
     candidates = build_candidates(scanner.signal_processor, instrument, mtf_result,
         configuration, lots, lot_size, settings)
     rows = scanner._get_session_trade_candidates(instrument)
     scanner._refresh_trade_candidates(rows, configuration, allow_blocking=False)
-    cache = getattr(scanner, "_intel_cache", {}) or {}
-    intelligence = copy.deepcopy(cache.get(f"{instrument}_5min", cache.get(instrument, {})) or {})
+    if historical:
+        panel = getattr(scanner, "_historical_panel_intel", None)
+        intelligence = panel(instrument) if callable(panel) else {}
+    else:
+        cache = getattr(scanner, "_intel_cache", {}) or {}
+        intelligence = dict(cache.get(f"{instrument}_5min", cache.get(instrument, {})) or {})
+        horizons = getattr(scanner, "_live_regime_horizons", None)
+        if intelligence and callable(horizons):
+            intelligence["regime_horizons"] = horizons(
+                instrument, session_context=intelligence.get("session_context"),
+                breadth_context=intelligence.get("breadth_context"))
     intelligence["potential_rr"] = selected_rr(settings, "5min")
     label, session, preopen, settlement = scanner._dashboard_quote_session(quote)
     held = {}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from loguru import logger
@@ -12,6 +13,41 @@ from loguru import logger
 # charge model into fantasy: options 0.02%..0.60% of premium, futures 0.2..5 bps.
 _OPT_CALIBRATION_BOUNDS = (0.0002, 0.006)
 _FUT_CALIBRATION_BOUNDS = (0.00002, 0.0005)
+
+
+def estimate_upstox_derivative_fees(
+    entry: float, exit_price: float, quantity: int, inst_type: str, *,
+    instrument: str, direction: str, trade_date: date, multiplier: float = 1.0,
+) -> float:
+    """Estimate standard Upstox charges across two intraday execution legs."""
+    option = inst_type == "OPT"
+    bse = instrument.upper() == "SENSEX"
+    units = quantity if option else quantity * multiplier
+    buy, sell = entry * units, exit_price * units
+    if not option and direction.upper() in {"SHORT", "SELL"}:
+        buy, sell = sell, buy
+    turnover = buy + sell
+    brokerage = 40.0 if option else min(20, buy * .0005) + min(20, sell * .0005)
+    if trade_date >= date(2026, 4, 1):
+        stt_rate = .0015 if option else .0005
+    elif trade_date >= date(2024, 10, 1):
+        stt_rate = .001 if option else .0002
+    else:
+        stt_rate = .000625 if option else .000125
+    if bse:
+        exchange_rate = (.000325 if trade_date >= date(2024, 10, 1) else .000495) if option else 0
+    elif trade_date >= date(2026, 3, 1):
+        exchange_rate = .0003553 if option else .0000183
+    elif trade_date >= date(2024, 10, 1):
+        exchange_rate = .0003503 if option else .0000173
+    else:
+        exchange_rate = .000495 if option else .0000188
+    ipft_rate = 0 if bse else (1e-9 if trade_date >= date(2026, 3, 1) else .000005 if option else .000001)
+    exchange_charges = turnover * (exchange_rate + ipft_rate)
+    gst = .18 * (brokerage + exchange_charges)
+    stamp_duty = buy * (.00003 if option else .00002)
+    sebi_fee = turnover * .000001
+    return round(brokerage + exchange_charges + gst + sell * stt_rate + stamp_duty + sebi_fee, 2)
 
 
 def _calibrated_leg_fraction(settings: Any, inst_type: str, instrument: str) -> float | None:
@@ -53,6 +89,8 @@ def estimate_trade_charges(
     settings: Any,
     multiplier: float = 1.0,
     instrument: str = "",
+    *,
+    minimum_base_charge: float = 0.0,
 ) -> float:
     """Return the round-trip charge (flat cost + modeled slippage) used by every trade view.
 
@@ -87,4 +125,4 @@ def estimate_trade_charges(
             else float(getattr(settings, "slippage_fut_bps", 2.0) or 0.0) / 10000.0
         )
         slippage = (entry + exit_) * qty * mult * slip_bps
-    return round(base + max(0.0, slippage), 2)
+    return round(max(base, minimum_base_charge) + max(0.0, slippage), 2)

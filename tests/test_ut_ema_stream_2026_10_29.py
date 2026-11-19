@@ -227,6 +227,11 @@ def test_cold_retired_owner_resumes_future_observations(monkeypatch,tmp_path):
     scanner.mtf.engines={}
     scanner.mtf._retired_utema_engines={"NIFTY_5min":adapter}
     service=UTEmaTickService(scanner,checkpoint_dir=tmp_path)
+    service.process_observation("NIFTY",998.05,pd.Timestamp("2026-10-29 12:35:00"),1)
+    assert adapter._native._timeline is None
+    assert not service.submit("NIFTY",998.05,pd.Timestamp("2026-10-29 12:35:00"))
+    trade=NS(instrument="NIFTY",timeframe="5min")
+    assert service.monitor_owner(trade,"held",None) is None
     service.process_observation("NIFTY",998.05,pd.Timestamp("2026-10-29 12:35:01"),1)
     service.process_observation("NIFTY",1000.,pd.Timestamp("2026-10-29 12:35:02"),2)
     assert adapter._native._timeline is not None
@@ -251,6 +256,51 @@ def test_missing_bars_pause_then_complete_history_repairs_baseline(monkeypatch,t
     assert service.health["NIFTY_5min"]["historical_rebuild"]
     assert service.health["NIFTY_5min"]["live_tick_path_restored"] is False
     assert list(tmp_path.glob("*_before_rebuild_*.json"))
+
+
+def test_upstox_rebuilds_logged_gap_only_from_complete_official_minutes(monkeypatch, tmp_path):
+    scanner, adapter, _ = real_host(monkeypatch)
+    scanner.data.upstox_only = True
+    index = pd.date_range("2026-11-19 09:15", "2026-11-19 13:29", freq="min")
+    minute = pd.DataFrame({"open": 998.05, "high": 998.4, "low": 998.0, "close": 998.2,
+                           "price_source": "upstox_history"}, index=index)
+    five = minute.drop(columns="price_source").resample("5min").first()
+    unpublished = minute.copy()
+    unpublished.loc["2026-11-19 13:04", "price_source"] = "live_tick"
+    frames = {"1min": unpublished, "5min": five}
+    scanner.candles.get_candles = lambda instrument, timeframe: frames[timeframe]
+    service = UTEmaTickService(scanner, checkpoint_dir=tmp_path)
+    before = pd.Timestamp("2026-11-19 12:59:00")
+    after = pd.Timestamp("2026-11-19 13:31:17")
+    service.process_observation("NIFTY", 998.05, before, 1)
+    service.process_observation("NIFTY", 998.20, after, 2)
+    assert "expected 2026-11-19T13:00:00, observed 2026-11-19T13:30:00" in service.health["NIFTY_5min"]["detail"]
+    service.process_observation("NIFTY", 998.20, after + pd.Timedelta(seconds=1), 3)
+    assert service.health["NIFTY_5min"]["status"] == "ERROR"
+
+    frames["1min"] = minute
+    service.process_observation("NIFTY", 998.20, after + pd.Timedelta(seconds=2), 4)
+    assert service.health["NIFTY_5min"]["status"] == "READY"
+    assert service.health["NIFTY_5min"]["historical_rebuild"]
+    assert service.health["NIFTY_5min"]["live_tick_path_restored"] is False
+    assert all(stamp in adapter._native._stream_times
+               for stamp in pd.date_range("2026-11-19 13:00", "2026-11-19 13:25", freq="5min"))
+
+
+def test_muhurat_history_uses_the_special_session_grid(monkeypatch, tmp_path):
+    scanner, _, _ = real_host(monkeypatch)
+    scanner.data.upstox_only = True
+    index = pd.date_range("2026-11-08 14:20", "2026-11-08 15:29", freq="min")
+    minute = pd.DataFrame({"open": 998.05, "high": 998.4, "low": 998.0, "close": 998.2,
+                           "price_source": "upstox_history"}, index=index)
+    misaligned = minute.drop(columns="price_source").resample("15min").first()
+    scanner.candles.get_candles = lambda *args: minute
+    service = UTEmaTickService(scanner, checkpoint_dir=tmp_path)
+    close = pd.Timestamp("2026-11-08 15:30")
+
+    rebuilt = service._bootstrap_history("NIFTY", "15min", misaligned, close)
+    assert list(rebuilt.index) == list(pd.date_range("2026-11-08 14:20", "2026-11-08 15:20", freq="15min"))
+    assert not service._history_gap(rebuilt, "15min", close)
 
 
 def test_corrupt_journal_restore_is_transactional(tmp_path):

@@ -52,3 +52,40 @@ def test_empty_chain_keeps_measured_volume_and_marks_oi_pcr_unavailable():
     assert result["oi"]["available"] is False
     assert result["pcr"]["available"] is False
     assert result["data_quality"]["reason"] == "Option chain unavailable"
+
+
+def test_historical_panel_uses_the_last_closed_replay_bar():
+    from scanner import Scanner
+
+    scanner = Scanner.__new__(Scanner)
+    scanner.candles = SimpleNamespace(get_candles=lambda _, tf: pd.DataFrame(
+        {"close": [25000.]}, index=[pd.Timestamp({
+            "5min": "2026-11-19 14:15", "1min": "2026-11-19 14:15",
+        }[tf])]
+    ))
+    calls = []
+    def lookup(instrument, clock, timeframe, *, panel):
+        calls.append((instrument, clock, timeframe, panel))
+        return {"pcr": {"primary_pcr": 1.2}, "as_of": clock.isoformat()}
+    scanner._get_historical_intel_context_at = lookup
+    scanner._live_regime_horizons = lambda *args, as_of, **kwargs: {"day": {"regime": "RANGING"}}
+
+    result = scanner._historical_panel_intel("NIFTY")
+    assert calls == [("NIFTY", pd.Timestamp("2026-11-19T14:15:00+05:30"), "5min", True)]
+    assert result["pcr"]["primary_pcr"] == 1.2
+    assert result["regime_horizons"]["day"]["regime"] == "RANGING"
+
+
+def test_upstox_option_volume_stays_separate_from_missing_spot_volume():
+    frame = pd.DataFrame({name: [25000.] * 40 for name in ("open", "high", "low", "close")},
+                         index=pd.date_range("2026-11-19 09:15", periods=40, freq="5min"))
+    frame["volume"] = 0.0
+    chain = pd.DataFrame({"strike": [24950, 25000, 25050], "call_oi": [100] * 3, "put_oi": [120] * 3,
+                          "call_volume": [10] * 3, "put_volume": [20] * 3})
+    chain.attrs["expiry"] = "2026-11-23"
+    result = IntelligenceAggregator().analyze(
+        "NIFTY", "5min", frame, options_chain=chain, spot_price=25000.,
+        chain_quality={"source": "upstox", "intelligence_usable": True, "volume_complete": True})
+    assert result["volume"]["available"] is False
+    assert result["option_volume"]["quantity"] == 90
+    assert result["oi"]["available"] and result["pcr"]["primary_pcr"] == 1.2

@@ -2969,7 +2969,7 @@ class TradeManager:
                         self._last_protective_sync[trade.id] = 0.0
                     return adopted
                 prior_state, prior = "CONFLICT", ""
-            if prior_state in {"AMBIGUOUS", "CONFLICT"}:
+            if prior_state in {"AMBIGUOUS", "CONFLICT", "UNKNOWN"}:
                 # Something is resting that we cannot match to this position. Placing
                 # another is how a contract ends up with several stops, and each extra
                 # one is a naked reversed leg waiting for the others to fill.
@@ -3285,10 +3285,25 @@ class TradeManager:
         if not isinstance(response, dict) or not isinstance(response.get("data"), list):
             return None, False
         symbol = str(getattr(trade, "trading_symbol", "") or "").upper()
+        key = str(getattr(trade, "symbol_token", "") or "")
         for row in response["data"]:
-            if str(row.get("tradingsymbol") or "").upper() == symbol:
+            row_key = str(row.get("symboltoken") or row.get("instrument_token") or "")
+            if not self._matches_position_product(row):
+                continue
+            exact_symbol = str(row.get("tradingsymbol") or "").upper() == symbol
+            legacy_symbol = (
+                str(row.get("execution_symbol") or "").upper() == symbol
+                and key and str(row.get("execution_token") or "") == key
+            )
+            if (exact_symbol and (not key or not row_key or row_key == key)) or legacy_symbol:
                 return row, True
         return None, True
+
+    def _matches_position_product(self, row: Dict) -> bool:
+        mapper = getattr(getattr(self, "broker", None), "_product", None)
+        product = row.get("product") or row.get("producttype")
+        wanted = getattr(self, "product_type", "")
+        return not (callable(mapper) and product and wanted) or mapper(product) == mapper(wanted)
 
     def _sole_trade_on_contract(self, trade) -> bool:
         """True when no OTHER open trade shares this contract.
@@ -3708,6 +3723,12 @@ class TradeManager:
             if price <= 0:
                 return False, "no usable price"
 
+            if self._live_contract_risk_required():
+                problem = self._upstox_contract_entry_error(
+                    trade.trading_symbol, trade.symbol_token, trade.lot_size, trade.inst_type)
+                if problem:
+                    return False, problem
+
             ok, why = (True, "") if native_alignment else self._scale_in_is_earned(trade, settings)
             if not ok:
                 return False, why
@@ -3715,7 +3736,7 @@ class TradeManager:
             # An add-on is new money at risk even though it is not a new position, so it
             # faces the rupee budget. It does NOT face the per-index/bucket count caps —
             # those bound how many ideas are live, and this is the same idea.
-            admitted, risk_why = (True, "") if native_alignment else self._entry_risk_admission(
+            admitted, risk_why = (True, "") if native_alignment and not self._live_contract_risk_required() else self._entry_risk_admission(
                 inst_type=trade.inst_type,
                 direction=trade.direction,
                 price=price,
@@ -3725,6 +3746,7 @@ class TradeManager:
                 lot_size=int(trade.lot_size or 1),
                 instrument_multiplier=float(getattr(trade, "instrument_multiplier", 1.0) or 1.0),
                 is_recovery=False,
+                instrument=trade.instrument,
             )
             if not admitted:
                 return False, f"entry risk budget: {risk_why}"
@@ -4219,6 +4241,18 @@ class TradeManager:
         # never stop trading, only a definitive "not enough money" may. Refusing here
         # touches nothing on the parent position — it is still running, still protected by
         # the stop that covers its current quantity.
+        if self._live_contract_risk_required():
+            with self._lock:
+                admitted, risk_reason = self._entry_risk_admission(
+                    inst_type=trade.inst_type, direction=trade.direction, price=order_price,
+                    trailing_stop=trade.current_stop or trade.trailing_stop,
+                    initial_stop=trade.initial_stop, lots=add_lots, lot_size=trade.lot_size,
+                    instrument_multiplier=trade.instrument_multiplier, is_recovery=False,
+                    instrument=trade.instrument, scale_in_trade_id=trade.id,
+                )
+            if not admitted:
+                logger.warning(f"Scale-in refused at broker submission: {risk_reason}")
+                return
         preflight = self._entry_margin_verdict(
             trade.trading_symbol, quantity, entry_side, order_price
         )
@@ -4597,16 +4631,34 @@ class TradeManager:
             )
         return True, ""
 
+    def _live_contract_risk_required(self) -> bool:
+        from trading.angelone_broker import AngelOneBroker
+        from trading.upstox_broker import UpstoxBroker
+
+        return self._live_orders_permitted() and isinstance(
+            getattr(self, "broker", None), (AngelOneBroker, UpstoxBroker)
+        )
+
+    @staticmethod
+    def _upstox_contract_entry_error(symbol, key, lot_size, inst_type):
+        from engine.expiry_manager import expiry_manager
+
+        contract = expiry_manager.upstox_contract(str(key or ""), require_current=True)
+        expected_type = "OPTIDX" if inst_type == "OPT" else "FUTIDX"
+        if not contract or contract.get("symbol") != symbol or contract.get("instrumenttype") != expected_type:
+            return "Exact execution contract missing from today's Upstox instrument master"
+        if contract.get("lotsize") != lot_size:
+            return "Entry lot size differs from today's Upstox instrument master"
+        return ""
+
     def _entry_risk_admission(
         self, *, inst_type: str, direction: str, price: float, trailing_stop: float,
         initial_stop: float, lots: int, lot_size: int, instrument_multiplier: float,
-        is_recovery: bool,
+        is_recovery: bool, instrument: str = "", scale_in_trade_id: str = "",
     ) -> Tuple[bool, str]:
         """Refuse an entry that would push the book past its stop-risk budget.
 
-        Off by default. It earns its keep once several lots run across several indices
-        with cascade scaling enabled — at one or two positions the daily circuit breaker
-        already covers nearly the same ground, and the extra refusal is noise.
+        Required for live exposure using an authoritative derivative master.
 
         Recovery entries bypass it, matching can_open_trade: a recovery is re-establishing
         protection on a position that already exists, and refusing it strands the very
@@ -4615,12 +4667,23 @@ class TradeManager:
         from config.settings import get_settings
 
         settings = get_settings()
-        if not _setting_enabled(
+        live_contract = self._live_contract_risk_required()
+        if not live_contract and not _setting_enabled(
             getattr(settings, "entry_risk_budget_enabled", False), False
         ):
             return True, ""
         if is_recovery:
             return True, ""
+        positions = list(self.open_trades.values())
+        if live_contract:
+            for trade in positions:
+                if str(getattr(trade, "execution_status", "") or "").upper() == "RECOVERY_REQUIRED":
+                    return False, "Broker exposure requires reconciliation"
+                if getattr(trade, "id", "") != scale_in_trade_id and (
+                    getattr(trade, "_scale_in_inflight", False)
+                    or getattr(trade, "scale_in_requested_quantity", 0)
+                ):
+                    return False, "An unsettled scale-in prevents proof of available risk"
         # Enabled means the operator asked for a PROOF that this entry fits the budget.
         # When that proof cannot be computed the entry is refused, the same answer the
         # pure evaluator gives for unknown risk. This used to admit the entry on import
@@ -4638,23 +4701,51 @@ class TradeManager:
         candidate = {
             "inst_type": inst_type, "direction": direction, "price": price,
             "current_stop": trailing_stop, "initial_stop": initial_stop,
-            "lots": lots, "lot_size": lot_size, "multiplier": instrument_multiplier,
+            "lots": lots, "lot_size": lot_size, "instrument_multiplier": instrument_multiplier,
+            "instrument": instrument,
         }
         # Same budgets the circuit breaker enforces, so there is one source of truth for
         # "how much may be lost" rather than two ladders that can drift apart.
         capital_fut = float(getattr(settings, "capital_fut", 0.0) or 0.0)
         capital_opt = float(getattr(settings, "capital_opt", 0.0) or 0.0)
         capital_total = float(getattr(settings, "capital_total", 0.0) or 0.0)
+        if live_contract:
+            stop = float(trailing_stop or initial_stop or 0)
+            long_premium = inst_type == "OPT" or str(direction).upper() in {"LONG", "BUY"}
+            wrong_side = stop >= price if long_premium else stop <= price
+            if wrong_side:
+                return False, "Protective trigger is on the wrong side of the planned entry"
+
+        def estimate_cost(item, entry, stop, qty, segment, multiplier):
+            from engine.trade_accounting import estimate_trade_charges, estimate_upstox_derivative_fees
+            from trading.kite_broker import KiteBroker
+            details = item if isinstance(item, dict) else vars(item)
+            index = str(details.get("instrument") or "").split()[0] if details.get("instrument") else ""
+            from trading.upstox_broker import UpstoxBroker
+            fees = estimate_upstox_derivative_fees(
+                entry, stop, qty, segment, instrument=index, direction=str(details.get("direction") or ""),
+                trade_date=datetime.now(IST).date(), multiplier=multiplier,
+            ) if isinstance(self.broker, UpstoxBroker) else 0.0
+            stop_buffer = 0.0
+            if segment == "OPT":
+                limit = KiteBroker._protective_stop_params("OPTCE", "SELL", stop)["price"]
+                stop_buffer = max(0.0, stop - limit) * qty
+            return stop_buffer + estimate_trade_charges(
+                entry, stop, qty, segment, settings, multiplier,
+                instrument=index, minimum_base_charge=fees,
+            )
+
         try:
             decision = evaluate_entry_risk(
                 candidate,
-                list(self.open_trades.values()),
+                positions,
                 fut_limit_rs=capital_fut * float(getattr(settings, "risk_fut_pct", 0.0) or 0.0) / 100.0,
                 opt_limit_rs=capital_opt * float(getattr(settings, "risk_opt_pct", 0.0) or 0.0) / 100.0,
                 global_limit_rs=capital_total * float(getattr(settings, "max_daily_loss_pct", 0.0) or 0.0) / 100.0,
                 max_trade_loss_abs=float(getattr(settings, "max_trade_loss_abs", 0.0) or 0.0),
                 slippage_bps=float(getattr(settings, "slippage_fut_bps", 0.0) or 0.0),
                 realized_loss_by_segment=self._realized_loss_by_segment(),
+                estimate_cost=estimate_cost if live_contract else None,
             )
         except Exception as exc:
             logger.error(f"Entry-risk evaluation failed, refusing entry: {exc}")
@@ -5435,16 +5526,17 @@ class TradeManager:
 
     def reconcile_broker_positions(self, positions_resp: Optional[Dict] = None) -> Dict:
         """Reconcile local trades and broker-only positions in both directions."""
-        if not self.broker:
+        snapshot_broker = self.broker
+        if not snapshot_broker:
             return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
-        get_positions = getattr(self.broker, "get_positions", None)
+        get_positions = getattr(snapshot_broker, "get_positions", None)
         if positions_resp is None:
             if not callable(get_positions):
                 return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
             positions_resp = get_positions()
         if not isinstance(positions_resp, dict):
             return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
-        rows = positions_resp.get("data", [])
+        rows = positions_resp.get("data")
         if not isinstance(rows, list):
             return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
 
@@ -5456,42 +5548,36 @@ class TradeManager:
         # strike from the Kite app puts a second row on that symbol, and reconciliation
         # is the single authority allowed to close a position. Rank deterministically:
         # our own product first, then a row that actually holds quantity.
-        wanted_product = ""
-        _mapper = getattr(getattr(self, "broker", None), "_product", None)
-        if callable(_mapper):
-            try:
-                from config.settings import get_settings as _get_settings
-
-                wanted_product = str(
-                    _mapper(getattr(_get_settings(), "trade_product_type", "")) or ""
-                ).upper()
-            except Exception:
-                wanted_product = ""
-
-        def _position_row_rank(row: Dict) -> Tuple[int, int]:
-            product = str(row.get("producttype") or row.get("product") or "").upper()
-            try:
-                held = abs(int(float(row.get("netqty") or row.get("quantity") or 0)))
-            except (TypeError, ValueError):
-                held = 0
-            return (
-                1 if wanted_product and product == wanted_product else 0,
-                1 if held else 0,
-            )
-
         broker_pos: Dict[str, Dict] = {}
+        foreign = {}
         for row in rows:
             symbol = str(row.get("tradingsymbol") or "")
             if not symbol or not symbol.upper().startswith(allowed_prefixes):
                 continue
+            if not self._matches_position_product(row):
+                if self._position_quantity(row):
+                    product = str(row.get("product") or row.get("producttype") or "")
+                    foreign[f"{symbol} [{product}]"] = dict(
+                        row, foreign_product=True, status="ORPHANED", execution_status="ORPHANED"
+                    )
+                continue
             held_row = broker_pos.get(symbol)
-            if held_row is None or _position_row_rank(row) > _position_row_rank(held_row):
+            if held_row is None or (not self._position_quantity(held_row) and self._position_quantity(row)):
                 broker_pos[symbol] = row
         closed = 0
         confirmed = 0
         changed = False
         with self._lock:
+            if self.broker is not snapshot_broker:
+                return {"checked": False, "orphans": 0, "closed": 0, "confirmed": 0}
             local_snapshot = list(self.open_trades.items())
+            native = {(row.get("execution_symbol"), row.get("execution_token")): row
+                      for row in broker_pos.values() if row.get("execution_symbol") and row.get("execution_token")}
+            for _, trade in local_snapshot:
+                row = native.get((trade.trading_symbol, str(trade.symbol_token or "")))
+                if row and (trade.trading_symbol, trade.symbol_token) != (row["tradingsymbol"], row["symboltoken"]):
+                    trade.trading_symbol, trade.symbol_token = row["tradingsymbol"], row["symboltoken"]
+                    changed = True
 
         # One position row can back several local trades on the same contract, so the
         # row's net quantity is split ONCE here rather than handed to each of them.
@@ -6196,21 +6282,32 @@ class TradeManager:
                 self.ensure_broker_protection(trade, allocated_qty)
                 changed = True
 
-        orphans = {}
+        orphans = dict(foreign)
         for symbol, position in broker_pos.items():
             if self._position_quantity(position) != 0 and symbol not in local_symbols:
                 orphan = dict(position)
                 orphan["execution_status"] = "ORPHANED"
                 orphan["status"] = "ORPHANED"
                 orphans[symbol] = orphan
-        if orphans != self.orphan_positions:
+        def exposure(positions):
+            return {symbol: (self._position_quantity(row), row.get("symboltoken"),
+                             row.get("producttype") or row.get("product"))
+                    for symbol, row in positions.items()}
+
+        with self._lock:
+            if self.broker is not snapshot_broker:
+                return {"checked": False, "orphans": 0, "closed": closed, "confirmed": confirmed}
+            changed_exposure = exposure(orphans) != exposure(self.orphan_positions)
             self.orphan_positions = orphans
-            changed = True
-            if orphans:
-                logger.critical(
-                    "Broker-only positions require reconciliation: "
-                    + ", ".join(sorted(orphans))
-                )
+            if self.broker is snapshot_broker and self._live_contract_risk_required():
+                self._live_position_snapshot = (snapshot_broker, time.monotonic())
+        if changed_exposure and orphans:
+            logger.critical(
+                "Broker-only positions require reconciliation. New entries blocked: "
+                + ", ".join(sorted(orphans))
+            )
+        elif changed_exposure:
+            logger.info("Broker-only position reconciliation cleared")
         if changed:
             self._mark_dirty()
         return {
@@ -6310,8 +6407,8 @@ class TradeManager:
             restored[symbol] = consumed
         return restored
 
-    @staticmethod
-    def _drop_delisted_open_records(records):
+    @classmethod
+    def _drop_delisted_open_records(cls, records):
         """Refuse only the known persisted test-fixture signature.
 
         2026-08-19: four rows sat OPEN across six restarts and produced a dashboard
@@ -6372,7 +6469,7 @@ class TradeManager:
                     "would otherwise be marked to live spot and counted in the total."
                 )
                 continue
-            if symbol and symbol not in tradable:
+            if symbol and symbol not in tradable and not cls._unfilled_replay_record(record):
                 logger.critical(
                     f"Retaining unlisted OPEN recovery row {(record or {}).get('id')} "
                     f"{symbol} until authoritative broker reconciliation; listing "
@@ -6398,6 +6495,7 @@ class TradeManager:
 
     def load_state(self):
         """Load state from SQLite on startup"""
+        self._trade_state_loaded = False
         try:
             self._realised_booked_today = {}
             stored_open_records = db.load_open_trades()
@@ -6551,10 +6649,11 @@ class TradeManager:
             )
             
             self._recover_trade_counter()
+            self._trade_state_loaded = True
             if self.open_trades or self.closed_trades:
                 logger.success(f"♻️ Recovered {len(self.open_trades)} active and {len(self.closed_trades)} historical trades from DB.")
-        except Exception as e:
-            logger.error(f"Failed to load trade state from DB: {e}")
+        except Exception:
+            logger.exception("Failed to load trade state from DB. New entries blocked.")
 
     def _recover_trade_counter(self) -> None:
         """Continue generated trade IDs above every persisted T-number."""
@@ -6690,8 +6789,20 @@ class TradeManager:
     def can_open_trade(self, is_recovery: bool = False, *, native_utema: bool = False) -> Tuple[bool, str]:
         """Check if we can open a new trade"""
         with self._lock:
+            if not is_recovery and not getattr(self, "_trade_state_loaded", True):
+                return False, "Trade ledger restore failed"
             if not is_recovery and self.orphan_positions:
                 return False, "Broker-only orphan position requires reconciliation"
+            if not is_recovery and self._live_contract_risk_required():
+                from config.settings import get_settings
+
+                broker, observed = getattr(self, "_live_position_snapshot", (None, 0.0))
+                settings = get_settings()
+                delay = max(float(settings.position_sync_interval_seconds),
+                            float(settings.position_sync_idle_interval_seconds))
+                if broker is not self.broker or not 0 <= time.monotonic() - observed <= delay + 10:
+                    self.nudge_position_sync()
+                    return False, "A fresh execution broker position reconciliation is required"
             active_positions = sum(
                 1
                 for trade in self.open_trades.values()
@@ -7095,6 +7206,11 @@ class TradeManager:
             if not can:
                 logger.warning(f"Cannot open trade: {reason}")
                 return None
+            if self._live_contract_risk_required() and not (is_recovery or is_ghost or getattr(self, "is_warmup", False)):
+                contract_problem = self._upstox_contract_entry_error(trading_symbol, symbol_token, lot_size, inst_type)
+                if contract_problem:
+                    self._log_ui(f"Entry refused: {contract_problem}", "warning")
+                    return None
             same, same_reason = self._same_contract_entry_blocked(
                 trading_symbol, is_recovery=is_recovery, is_ghost=is_ghost,
                 **({"native_owner": "UTEMA"} if native_utema else {}),
@@ -7139,13 +7255,13 @@ class TradeManager:
             # Would accepting this candidate make the BOOK unsafe at its configured
             # stops? can_open_trade counts positions; the circuit breaker measures a book
             # that already exists. Neither refuses the entry that creates the breach.
-            # Off by default — see _entry_risk_admission.
-            admitted, risk_reason = (True, "") if native_utema else self._entry_risk_admission(
+            admitted, risk_reason = (True, "") if native_utema and not self._live_contract_risk_required() else self._entry_risk_admission(
                 inst_type=inst_type, direction=direction, price=price,
                 trailing_stop=trailing_stop, initial_stop=initial_stop,
                 lots=lots, lot_size=lot_size,
                 instrument_multiplier=instrument_multiplier,
                 is_recovery=is_recovery,
+                instrument=instrument,
             )
             if not admitted:
                 logger.warning(f"Entry refused by projected stop-risk budget: {risk_reason}")
@@ -8705,7 +8821,7 @@ class TradeManager:
             quantity = self._position_quantity(position)
             if not quantity:
                 continue
-            if not flatten:
+            if not flatten or position.get("foreign_product"):
                 self._alert_orphan_left_open(symbol, quantity)
                 continue
             # Latch BEFORE sending, once per symbol per session. check_session_end runs

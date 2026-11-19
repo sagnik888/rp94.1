@@ -129,7 +129,7 @@ def test_factory_returns_alt_for_ema_consensus_auto(settings_engine):
         assert isinstance(e, AltSignalEngine) and e.signal_source == mode
 
 
-def test_alt_engine_fallback_logs_warning(monkeypatch):
+def test_alt_engine_fails_closed_and_logs(monkeypatch):
     df = _trending_df()
     engine = AltSignalEngine(signal_source="ema", **_PARAMS)
     warnings = []
@@ -141,14 +141,14 @@ def test_alt_engine_fallback_logs_warning(monkeypatch):
         warnings.append(message.format(*args))
 
     monkeypatch.setattr(engine, "_alt_positions", fail_positions)
-    monkeypatch.setattr(alt_scanners.logger, "warning", record_warning)
+    monkeypatch.setattr(alt_scanners.logger, "error", record_warning)
 
     result = _process(engine, df)
 
-    assert "error" not in result
-    assert "signals" in result
+    assert result["error"] == "ENGINE_DEGRADED"
+    assert result["signals"] == []
     assert warnings
-    assert "falling back to UT1 result" in warnings[0]
+    assert "ENGINE_DEGRADED" in warnings[0]
     assert "engine=ema" in warnings[0]
     assert "instrument=NIFTY" in warnings[0]
     assert "timeframe=5min" in warnings[0]

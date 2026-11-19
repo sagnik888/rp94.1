@@ -1,6 +1,19 @@
 """Compose unchanged native engines with explicit result ownership."""
 import copy
-from engine.scanner_modes import COMBINED_MODES
+import pandas as pd
+from loguru import logger
+
+from engine.scanner_modes import COMBINED_MODES, owner
+
+
+def _cutoff_frame(frame, cutoff):
+    if frame is None or frame.empty:
+        return frame
+    index = pd.DatetimeIndex(frame.index)
+    if index.tz is not None:
+        index = index.tz_convert("Asia/Kolkata").tz_localize(None)
+    keep = index <= cutoff
+    return frame if keep.all() else frame.loc[keep]
 
 
 class CombinedSignalEngine:
@@ -20,6 +33,21 @@ class CombinedSignalEngine:
         # lane retains its own standalone cache rules and computation clock.
         cached_s1 = kwargs.pop('_s1_cached_result', None)
         cached_base = kwargs.pop('_base_cached_result', None)
+        as_of = kwargs.get('as_of')
+        if as_of is not None:
+            cutoff = pd.Timestamp(as_of)
+            if cutoff.tzinfo is not None:
+                cutoff = cutoff.tz_convert("Asia/Kolkata").tz_localize(None)
+            clipped = _cutoff_frame(df, cutoff)
+            if clipped is not df:
+                cached_base = cached_s1 = None
+                df = clipped
+            for dependency in ('df_5min', 'df_15min'):
+                if dependency in kwargs:
+                    frame = kwargs[dependency]
+                    kwargs[dependency] = _cutoff_frame(frame, cutoff)
+                    if kwargs[dependency] is not frame:
+                        cached_s1 = None
         results = {}
         for mode, engine in self.native_engines.items():
             if mode == self.base_mode and cached_base is not None and not cached_base.get('error'):
@@ -34,12 +62,18 @@ class CombinedSignalEngine:
                     native_kwargs.pop('as_of', None)
                 results[mode] = engine.process(df=df, instrument=instrument, timeframe=timeframe, **native_kwargs)
             except Exception as exc:
+                logger.error("ENGINE_DEGRADED engine={} instrument={} timeframe={} error={}",
+                             mode, instrument, timeframe, type(exc).__name__)
                 results[mode] = {'error': str(exc) or type(exc).__name__, 'signals': [], 'state': None,
                                  'source_engine': mode}
         base = results[self.base_mode]
         # Base chart arrays remain intact; both native entry/exit histories are visible.
         merged = dict(base)
-        merged.update(source_engine=self.signal_source, native_results=results)
+        healthy = {mode: not bool(result.get('error')) for mode, result in results.items()}
+        merged.update(source_engine=self.signal_source, native_results=results,
+                      combined_health=('FULL' if all(healthy.values()) else
+                                       'DEGRADED' if any(healthy.values()) else 'HALTED'),
+                      native_entry_eligible=healthy)
         merged['signals'] = sorted([signal for result in results.values()
             if not result.get('error') for signal in result.get('signals', [])],
             key=lambda signal: (signal.timestamp, signal.signal_type,
@@ -48,9 +82,9 @@ class CombinedSignalEngine:
             {**overlay, 'name': 'S1 ' + str(overlay.get('name', ''))}
             for overlay in results['s1'].get('indicator_overlays', [])]
         # Never let a base error hide a healthy S1 lane, or bless a missing base state.
-        if not base.get('state'):
-            merged['state'] = {'position': 0, 'position_label': 'FLAT', 'is_trending': False}
-        if any(not result.get('error') for result in results.values()):
+        if not healthy[self.base_mode] or not base.get('state'):
+            merged['state'] = {'position': 0, 'position_label': 'UNKNOWN', 'is_trending': False}
+        if any(healthy.values()):
             merged.pop('error', None)
         return merged
 
@@ -66,6 +100,9 @@ def native_mtf_view(result, mode):
             lane = None
         setattr(view, f'results_{tf}', lane)
         if lane:
+            lane = dict(lane, signals=[signal for signal in lane.get('signals', [])
+                                       if owner(signal) == mode])
+            setattr(view, f'results_{tf}', lane)
             native[tf] = lane
     from engine.multi_timeframe import MultiTimeframeEngine
     # The envelope can be new while just one native lane was recomputed. Keep
@@ -83,5 +120,6 @@ def native_mtf_view(result, mode):
     view.confluence_score, view.confluence_signal = MultiTimeframeEngine._compute_confluence(
         weights, native, result.instrument)
     view.active_signals = [signal for signal in getattr(result, 'active_signals', [])
-                          if (getattr(signal, 'source_engine', '') == 's1') == (mode == 's1')]
+                          if owner(signal) == mode
+                          and any(signal is item for lane in native.values() for item in lane['signals'])]
     return view

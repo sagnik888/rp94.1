@@ -66,3 +66,32 @@ def test_threshold_is_configurable():
     from config.settings import Settings
 
     assert Settings(_env_file=None).option_chain_intelligence_max_age_seconds == 300.0
+
+
+def test_cached_upstox_snapshot_keeps_oi_without_exchange_leg_clocks_or_volume():
+    sc = _scanner(60.0)
+    sc._chain_quality_cache["NIFTY"].update(
+        source="upstox", volume_complete=False, coverage_complete=True,
+        exchange_clocks_fresh=False, fetched_at_epoch=time.time() - 60.0,
+    )
+    _, quality = sc._get_option_chain_cached("NIFTY", {}, allow_fetch=False)
+    assert quality["intelligence_usable"] is True
+    assert quality["volume_complete"] is False
+    assert quality["exchange_clocks_fresh"] is False
+    assert quality["score"] == 0
+
+
+def test_failed_refresh_does_not_restamp_a_stale_upstox_chain():
+    from types import SimpleNamespace
+
+    sc = _scanner(320.0)
+    recorded_at = time.time() - 320.0
+    sc._chain_quality_cache["NIFTY"].update(source="upstox", fetched_at_epoch=recorded_at)
+    sc.data = SimpleNamespace(get_option_chain=lambda *args: pd.DataFrame())
+    before, first = sc._get_option_chain_cached("NIFTY", {}, force=True)
+    same, next_read = sc._get_option_chain_cached("NIFTY", {})
+    assert same is before
+    for quality in (first, next_read):
+        assert quality["fetched_at_epoch"] == recorded_at
+        assert quality["stale"] is True
+        assert quality["intelligence_usable"] is False

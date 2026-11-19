@@ -16,7 +16,8 @@ import csv
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from functools import wraps
 import pandas as pd
 import numpy as np
 from datetime import datetime, time as dtime, timedelta
@@ -135,6 +136,21 @@ _UNMEASURED_VOLUME_BASES = frozenset({
     "TICK_ACTIVITY", "INDEX_TICK_ACTIVITY", "TICK_ROLLING_AVG", "TICK_TIME_OF_DAY",
     "PROXY", "UNAVAILABLE", "MIXED_UNITS", "MIXED", "UNKNOWN", "",
 })
+
+
+def _synchronous_configuration(steps):
+    """Drive the same readiness and commit steps for synchronous callers."""
+    @wraps(steps)
+    def configure(*args, **kwargs):
+        with closing(steps(*args, **kwargs)) as pending:
+            result = None
+            while True:
+                try:
+                    check = pending.send(result)
+                except StopIteration as finished:
+                    return finished.value
+                result = check()
+    return configure
 
 
 class TokenBucket:
@@ -4922,6 +4938,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             except Exception as exc:
                 logger.debug(f"Readiness warning notification failed: {exc}")
 
+    async def configure_async(self, **changes):
+        """Wait for external readiness off the scanner loop before applying changes."""
+        with closing(self.configure.__wrapped__(self, **changes)) as pending:
+            result = None
+            while True:
+                try:
+                    check = pending.send(result)
+                except StopIteration as finished:
+                    return finished.value
+                result = await asyncio.to_thread(check)
+
+    @_synchronous_configuration
     def configure(self, capital_total=None, capital_fut=None, capital_opt=None, risk_fut_pct=None, risk_opt_pct=None,
                   lots=None, lots_fut=None, mode=None, reset=False, futures_sl_pct=None, options_sl_pct=None,
                   fut_cost=None, opt_cost=None, backtest_days=None, auto_mode=None, inst_pref=None, strike_selection=None, active_indices=None,
@@ -4932,6 +4960,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                   persist_settings=True, **kwargs):
         from config.settings import get_settings
         settings = get_settings()
+        revision = self._configure_revision = object()
         self._last_configure_block_reason = ""
         old_uts_timing = (
             uts_lane_policy.intrabar_enabled(settings),
@@ -5023,22 +5052,31 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     self.on_notification("REAL mode blocked. Confirm YES to switch to REAL.", "error")
                 return False
 
-            # Warm option chains so production_safe_mode_required passes configure()
             dp = getattr(self, "data", None)
-            indices_to_warm = proposed_active_indices if proposed_active_indices is not None else getattr(proposed_settings, "active_indices", [])
-            if dp and hasattr(dp, "get_option_chain"):
-                for idx in (indices_to_warm or []):
-                    if str(idx).strip():
-                        try:
-                            dp.get_option_chain(str(idx).strip())
-                        except Exception:
-                            pass
+            if not getattr(self.trades, "real_broker", None):
+                from trading.angelone_broker import AngelOneBroker
 
-            readiness = validate_real_mode_readiness(
-                proposed_settings,
-                getattr(self, "data", None),
-                **readiness_kwargs,
-            )
+                execution_broker = AngelOneBroker(instance_id=f"UT1:{settings.dashboard_port}")
+                execution_broker.set_execution_authority(self.trades._live_orders_permitted)
+                self.trades.real_broker = execution_broker
+            if getattr(dp, "upstox_only", False):
+                dp.execution_broker = self.trades.real_broker
+
+            indices_to_warm = proposed_active_indices if proposed_active_indices is not None else getattr(proposed_settings, "active_indices", [])
+            def warmed_readiness():
+                if dp and hasattr(dp, "get_option_chain"):
+                    for idx in indices_to_warm or []:
+                        if str(idx).strip():
+                            try:
+                                dp.get_option_chain(str(idx).strip())
+                            except Exception:
+                                pass
+                return validate_real_mode_readiness(proposed_settings, dp, **readiness_kwargs)
+
+            readiness = yield warmed_readiness
+            if self._configure_revision is not revision:
+                self._last_configure_block_reason = "configuration changed during REAL readiness checks"
+                return False
             self._surface_readiness_warnings(readiness)
             if getattr(settings, "production_safe_mode_required", True) and not readiness.get("ok"):
                 blockers = readiness.get("blockers") or ["readiness failed"]
@@ -5112,12 +5150,15 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # auto-execution on nothing more than a confirmation string. Re-validate broker
             # connectivity / warmup / feed freshness here before enabling auto-execution.
             if current_mode == "REAL" or requested_mode == "REAL":
-                readiness = validate_real_mode_readiness(
+                readiness = yield lambda: validate_real_mode_readiness(
                     proposed_settings,
                     getattr(self, "data", None),
                     require_option_chains=True,
                     **readiness_kwargs,
                 )
+                if self._configure_revision is not revision:
+                    self._last_configure_block_reason = "configuration changed during Auto readiness checks"
+                    return False
                 morning_blockers = self._auto_execution_morning_readiness_blockers(
                     active_indices=proposed_active_indices,
                 )
@@ -5475,35 +5516,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
             # â• â• â•  HOT-SWAP BROKER â• â• â•
             if mode == "REAL":
-                # â”€â”€â”€ REAL BROKER INITIALIZATION (Dynamic) â”€â”€â”€
-                # If real_broker is missing, try to connect and initialize it now
-                if not hasattr(self.trades, "real_broker") or not self.trades.real_broker:
-                    logger.info("📡 Attempting dynamic REAL broker connection...")
-                    from trading.upstox_broker import UpstoxBroker
-                    from trading.angelone_broker import AngelOneBroker
-                    from trading.failover_broker import FailoverBroker
-
-                    if not self.data.is_connected:
-                        self.data.connect()
-
-                    upstox_account_id = str(getattr(settings, "upstox_user_id", "") or "7JATYL").strip()
-                    upstox_broker = UpstoxBroker(
-                        account_id=upstox_account_id,
-                        instance_id=f"UT1:{getattr(settings, 'dashboard_port', '')}",
-                    )
-                    angel_broker = AngelOneBroker()
-                    new_real_broker = FailoverBroker(
-                        primary=upstox_broker,
-                        fallback=angel_broker,
-                        failover_threshold_seconds=float(getattr(settings, "upstox_failover_threshold_seconds", 30.0) or 30.0),
-                    )
-                    self.trades.real_broker = new_real_broker
-                    if hasattr(new_real_broker, "set_execution_authority"):
-                        new_real_broker.set_execution_authority(
-                            self.trades._live_orders_permitted
-                        )
-                    logger.info("✅ Dynamic Upstox broker connection successful")
-
                 if hasattr(self.trades, "real_broker") and self.trades.real_broker:
                     # Claim the cross-process account lease as part of entering REAL.
                     # It used to be acquired only in main.py at startup, and only when
@@ -5569,10 +5581,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             self.on_notification(f"REAL mode refused: {reason}", "error")
                         return False
                     self.trades.broker = self.trades.real_broker
-                    logger.info("📡 Broker Hot-Swapped to: LIVE EXECUTION (Upstox API v2 / Angel One Fallback)")
+                    logger.info("📡 Broker Hot-Swapped to: LIVE EXECUTION (Angel One)")
                 else:
                     logger.error("❌ CRITICAL: Attempted REAL mode without Broker connection!")
-                    self._last_configure_block_reason = "Upstox broker not connected"
+                    self._last_configure_block_reason = "Angel One execution broker unavailable"
                     self.mode = "HISTORICAL" # Safety fallback
                     self.runtime_mode = RuntimeMode.REPLAY.value
                     self.trades.broker = getattr(self.trades, "mock_broker", self.trades.broker)
@@ -5580,7 +5592,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     self.trades.mode = self.mode
                     settings.trading_mode = replay_fallback_mode
                     if self.on_notification:
-                        self.on_notification("Failed to switch to REAL mode! Upstox not connected.", "error")
+                        self.on_notification("Failed to switch to REAL mode. Angel One execution unavailable.", "error")
             else:
                 # Historical Mode: Signals analysed from Real Historical Data
                 self.trades.broker = getattr(self.trades, "mock_broker", self.trades.broker)
@@ -7154,7 +7166,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
 
     async def _background_hft_worker(self):
         """High-Frequency Trade Monitoring (100ms loop) for Spike Readiness"""
-        logger.info("âš¡ HFT Trade Monitor Started (100ms loop)")
+        logger.info("HFT Trade Monitor Started (100ms loop)")
         while self.is_running:
             try:
                 # allow_blocking=False: this runs on the scanner EVENT LOOP every
@@ -7535,7 +7547,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                                         task.result()
                                     except Exception as exc:
                                         logger.debug(f"Background intelligence task failed for {name}: {exc}")
-                    if self.mode == "REAL" and not self._initial_setup_completed:
+                    if self.mode == "HISTORICAL" or (self.mode == "REAL" and not self._initial_setup_completed):
                         await asyncio.sleep(1.0)
                         continue
                     indices = {k: v for k, v in self.config.get("indices", {}).items()
@@ -7543,10 +7555,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                     for name, cfg in indices.items():
                         if name in analyses or not self._background_intel_due(name, time.time()):
                             continue
-                        if self.mode != "REAL" and analyses:
-                            break  # Keep replay's existing sequential CPU budget.
                         generation = current_generation()
-                        if self.mode == "REAL" and name not in recoveries:
+                        if name not in recoveries:
                             recoveries[name] = asyncio.create_task(recover_chain(name, cfg, generation))
                         analyses[name] = asyncio.create_task(refresh_index(name, cfg, generation))
                     self._background_intel_inflight = bool(analyses or recoveries)
@@ -7590,7 +7600,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         # anniversary must not silently skip a whole minute of cash
                         # volume authority.
                         await self._fetch_all_data(
-                            indices, force=True, timeframes=["1min"]
+                            indices, force=True, timeframes=["1min"], intraday_refresh=True
                         )
                     finally:
                         self._background_history_inflight = False
@@ -9505,7 +9515,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
     # â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â•
     # PARALLEL DATA FETCH — major latency fix
     # â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â• â•
-    async def _fetch_all_data(self, indices: Dict, force=False, timeframes: Optional[List[str]] = None, days_back_override: Optional[int] = None):
+    async def _fetch_all_data(self, indices: Dict, force=False, timeframes: Optional[List[str]] = None,
+                              days_back_override: Optional[int] = None, *, intraday_refresh=False):
         """Fetch data for all instruments, only when cache expired"""
         selected_timeframes = timeframes or ["1min", "5min", "15min"]
         if str(getattr(self, "mode", "") or "").upper() == "HISTORICAL":
@@ -9549,6 +9560,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                             cfg,
                             tf,
                             days_back_override=days_back_override,
+                            **({"intraday_refresh": True} if intraday_refresh else {}),
                         )
                     )
                     self._last_data_fetch[cache_key] = now
@@ -9563,6 +9575,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         tf,
         days_back_override: Optional[int] = None,
         force_refresh: bool = False,
+        *,
+        intraday_refresh: bool = False,
     ):
         """Fetch one instrument-timeframe from the provider (in thread pool)."""
         loop = asyncio.get_event_loop()
@@ -9574,6 +9588,18 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         )
 
         final_fetch_days = _fetch_days(user_days, tf)
+        if (
+            intraday_refresh
+            and getattr(self, "mode", "") == "REAL"
+            and tf == "1min"
+            and getattr(self.data, "upstox_only", False) is True
+            and days_back_override is None
+            and not force_refresh
+            and self.candles.get_candle_count(name, tf) >= 500
+        ):
+            # Warm live refreshes only need today's complete minutes. Startup and
+            # explicit history reloads still request the full lookback.
+            final_fetch_days = 0
         history_started = time.perf_counter()
 
         try:
@@ -9598,6 +9624,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 if (
                     getattr(self, "mode", "HISTORICAL") == "REAL"
                     and tf == "1min"
+                    and final_fetch_days != 0
                     and self.candles.get_candle_count(name, tf) >= 500
                 ):
                     latest = self.candles.latest_candle_time(name, tf)
@@ -9721,29 +9748,35 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         except RuntimeError:
             _save()
 
-    def _assess_chain_quality(self, name: str, chain: Optional[pd.DataFrame], meta: Optional[Dict] = None) -> Dict:
+    def _assess_chain_quality(self, name: str, chain: Optional[pd.DataFrame], meta: Optional[Dict] = None,
+                              *, as_of: Optional[float] = None) -> Dict:
         meta = dict(meta or {})
         strike_count = int(len(chain)) if chain is not None else 0
-        fetched_at = float(meta.get("fetched_at", time.time()))
-        age = max(0.0, time.time() - fetched_at)
+        clock = time.time() if as_of is None else as_of
+        fetched_at = float(meta.get("fetched_at", clock))
+        age = clock - fetched_at
         fallback = bool(meta.get("fallback", strike_count <= 1))
         auto_certified = bool(meta.get("auto_certified", False))
         trusted_source = bool(not fallback or auto_certified)
+        upstox_snapshot = meta.get("source") == "upstox"
         if "coverage_complete" in meta:
             trusted_source = bool(trusted_source and meta["coverage_complete"]
-                                  and meta.get("exchange_clocks_fresh", False))
-        trusted_source = bool(trusted_source and meta.get("volume_complete", True))
-        if strike_count >= 10 and trusted_source:
+                                  and (upstox_snapshot or meta.get("exchange_clocks_fresh", False)))
+        # A fresh, exact-expiry Upstox REST snapshot supports OI/PCR even
+        # when per-leg volume is incomplete. Volume uses its own availability.
+        trusted_volume = trusted_source and meta.get("volume_complete", True)
+        trusted_intelligence = trusted_source and (upstox_snapshot or trusted_volume)
+        if strike_count >= 10 and trusted_volume:
             score = 95
-        elif strike_count >= 5 and trusted_source:
+        elif strike_count >= 5 and trusted_volume:
             score = 75
-        elif strike_count >= 3 and trusted_source:
+        elif strike_count >= 3 and trusted_volume:
             score = 60
         elif strike_count == 1:
             score = 35
         else:
             score = 0
-        expiry_aligned = bool(meta.get("expiry_aligned", meta.get("source") != "fyers"))
+        expiry_aligned = bool(meta.get("expiry_aligned", meta.get("source") not in {"upstox", "fyers"}))
         if meta.get("source") == "fyers" and not expiry_aligned:
             score = min(score, 50)
         try:
@@ -9755,10 +9788,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             intelligence_max_age = 300.0
         # `stale` remains the management/intelligence lifetime contract. New OPT
         # entries apply the stricter 120s/90s clock in the final entry gate.
-        stale = bool(age > max(10.0, intelligence_max_age))
+        stale = not 0 <= age <= max(10.0, intelligence_max_age)
         intelligence_usable = bool(
             strike_count >= 3
-            and trusted_source
+            and trusted_intelligence
             and expiry_aligned
             and not stale
         )
@@ -9820,42 +9853,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             self._chain_quality_cache.pop(name, None)
             cached = None
             last = 0.0
+        def cached_result():
+            saved = self._chain_quality_cache.get(name) or {}
+            observed = saved.get("fetched_at_epoch", last)
+            quality = Scanner._assess_chain_quality(
+                self, name, cached, {**saved, "fetched_at": observed}, as_of=time.time())
+            return cached, {**saved, **quality}
+
         if not force and cached is not None and now - last <= ttl:
-            quality = dict(self._chain_quality_cache.get(name, self._assess_chain_quality(name, cached)))
-            quality["age_seconds"] = round(now - last, 1)
-            quality["stale"] = False
-            return cached, quality
+            return cached_result()
 
         if not allow_fetch:
             if cached is not None:
-                age = now - last
-                quality = dict(self._chain_quality_cache.get(name, self._assess_chain_quality(name, cached)))
-                quality["age_seconds"] = round(age, 1)
-                # `stale` disqualifies the chain from intelligence (OI/PCR/Greeks) in
-                # IntelligenceAggregator. Deferring a re-fetch does NOT make a chain
-                # unusable — only real age does. Flagging every deferred read as stale
-                # meant that in REAL mode, where allow_fetch is False once a chain is
-                # cached, every scan after the short cache TTL handed intelligence a
-                # "stale" chain, which it then dropped: PCR/OI showed 0/unavailable all
-                # session even though the chain was being fetched successfully.
-                max_age = float(
-                    getattr(settings, "option_chain_intelligence_max_age_seconds", 300.0)
-                    or 300.0
-                )
-                quality["stale"] = age > max_age
-                quality["intelligence_usable"] = bool(
-                    not quality["stale"]
-                    and quality.get("volume_complete", True)
-                    and quality.get("coverage_complete", True)
-                    and quality.get("exchange_clocks_fresh", True)
-                    and int(quality.get("strike_count", 0) or 0) >= 3
-                    and bool(quality.get("expiry_aligned", False))
-                    and (
-                        not bool(quality.get("fallback", True))
-                        or bool(quality.get("auto_certified", False))
-                    )
-                )
-                return cached, quality
+                return cached_result()
             empty = pd.DataFrame()
             quality = self._assess_chain_quality(
                 name,
@@ -9880,12 +9890,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 chain = fetch()
         except Exception as e:
             logger.warning(f"Option chain fetch failed for {name}: {e}")
-            chain = cached if cached is not None else pd.DataFrame()
+            chain = None
         finally:
             self._last_chain_fetch[name] = now
 
         if chain is None:
             chain = pd.DataFrame()
+        if chain.empty and cached is not None:
+            return cached_result()
         meta = getattr(self.data, "_option_chain_meta", {}).get(name, {})
         quality = self._assess_chain_quality(name, chain, meta)
         if not chain.empty:
@@ -9894,11 +9906,6 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             shadow = getattr(self, "_buildup_shadow", None)
             if shadow is not None:
                 shadow.observe_chain(name, chain, at=now)
-        elif cached is not None:
-            quality = dict(self._chain_quality_cache.get(name, self._assess_chain_quality(name, cached)))
-            quality["age_seconds"] = round(now - last, 1)
-            quality["stale"] = True
-            chain = cached
         return chain, quality
 
     def _get_depth_context(self, name: str, cfg: Dict) -> Dict[str, Any]:
@@ -14400,7 +14407,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             elif not source_ok:
                 why = f"index price is not from the primary broker feed ({source or 'no source'})"
             else:
-                why = "Upstox/AngelOne index price is older than the freshness limit"
+                why = "Primary index price is older than the freshness limit"
             self._note_index_quote_refusal(instrument, why)
             return 0.0, "", ""
         (getattr(self, "_index_quote_refusals", None) or {}).pop(str(instrument or "").upper(), None)
@@ -15687,6 +15694,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         breadth_context: Optional[Dict[str, Any]] = None,
         lookback_bars: Optional[int] = None,
         force_redetect: bool = False,
+        as_of: Any = None,
     ) -> Dict[str, Any]:
         """Run (or reuse) RegimeDetector on a TF candle stream for the live panel.
 
@@ -15698,7 +15706,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         tf = str(timeframe or "5min").lower()
         # Prefer cached full intel regime (already smoothed) unless pocket lookback.
         cached = None
-        if not force_redetect and not lookback_bars:
+        if as_of is None and not force_redetect and not lookback_bars:
             try:
                 cached = self._cached_timeframe_intel(name, tf, allow_fallback=False)
             except Exception:
@@ -15720,6 +15728,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if not reg or str(reg.get("regime") or "UNKNOWN").upper() in {"", "UNKNOWN"} or lookback_bars or force_redetect:
             try:
                 df = self._live_analysis_window(self.candles.get_candles(name, tf), tf)
+                if as_of is not None:
+                    df = self._finalized_candles_at(df, tf, as_of)
             except Exception:
                 df = None
             if df is not None and lookback_bars is not None and len(df) > 0:
@@ -15737,7 +15747,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             # gates, and trailing regime labels. Dashboard-only detector.
             if not isinstance(getattr(self, "_panel_regime_detector", None), RegimeDetector):
                 self._panel_regime_detector = RegimeDetector()
-            detector = self._panel_regime_detector
+            detector = RegimeDetector() if as_of is not None else self._panel_regime_detector
             try:
                 if df is not None and len(df) >= 5:
                     # Distinct history key namespace so even if someone reuses
@@ -15944,6 +15954,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         *,
         session_context: Optional[Dict[str, Any]] = None,
         breadth_context: Optional[Dict[str, Any]] = None,
+        as_of: Any = None,
     ) -> Dict[str, Any]:
         """Live multi-horizon regimes for the dashboard (not session day-type mood).
 
@@ -15952,8 +15963,9 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         - day    = hybrid of hour pocket + full 15m session structure
         """
         name = str(instrument or "").split()[0].upper()
+        clock = {} if as_of is None else {"as_of": as_of}
         pulse = self._detect_tf_regime_snapshot(
-            name, "1min", session_context=session_context, breadth_context=breadth_context
+            name, "1min", session_context=session_context, breadth_context=breadth_context, **clock
         )
         # A detector needs 60 bars for BB/breakout readiness.  Use exactly that coherent
         # 5m window and label it honestly instead of a permanently partial "hour" model.
@@ -15964,9 +15976,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             breadth_context=breadth_context,
             lookback_bars=60,
             force_redetect=True,
+            **clock,
         )
         m15 = self._detect_tf_regime_snapshot(
-            name, "15min", session_context=session_context, breadth_context=breadth_context
+            name, "15min", session_context=session_context, breadth_context=breadth_context, **clock
         )
         day = self._hybrid_session_day_regime(hour, m15)
         # Primary live = 5m hour pocket (closest to engine tactical tape).
@@ -15981,7 +15994,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             "hour": hour,
             "day": day,
             "m15": m15,
-            "updated_at": datetime.now(IST).replace(tzinfo=None).isoformat(),
+            "updated_at": (pd.Timestamp(as_of) if as_of is not None else datetime.now(IST)).isoformat(),
         }
 
     @staticmethod
@@ -29657,12 +29670,21 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             dedupe_key = f"BROKER_{trade_id}_{signal_ts.isoformat()}"
             if self._last_opposite_exit_signal_time.get(dedupe_key) == signal_ts:
                 continue
-            exit_price = (
-                self._get_live_premium_cached(trade)
-                if str(getattr(trade, "inst_type", "") or "").upper() == "OPT"
-                else self.candles.get_latest_price(instrument)
-            )
-            exit_price = float(exit_price or getattr(trade, "current_price", 0.0) or signal.price)
+            option = str(getattr(trade, "inst_type", "") or "").upper() == "OPT"
+            upstox_live = (getattr(self, "mode", "") == "REAL"
+                           and getattr(getattr(self, "data", None), "upstox_only", False))
+            if upstox_live and not force_shock_exit:
+                exchange = "BFO" if str(trade.symbol_token).startswith("BSE_FO|") else "NFO"
+                exit_price = self.data.get_cached_contract_ltp(
+                    exchange, trade.trading_symbol, trade.symbol_token, max_age_seconds=3.0)
+                if not exit_price:
+                    self._request_premium_refresh(trade)
+                    continue
+                trade.quote_verified = True
+                trade.quote_source = "upstox_contract_cache"
+            else:
+                exit_price = self._get_live_premium_cached(trade) if option else self.candles.get_latest_price(instrument)
+                exit_price = float(exit_price or getattr(trade, "current_price", 0.0) or signal.price)
             if not self._quad_union_opposite_exit_allowed(trade, signal, exit_price):
                 continue
             self._close_and_record(
@@ -29817,10 +29839,14 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         Explicit 5M and 1m-inclusive policies are exact frame selections.
         """
         timeframe = str(getattr(candidate, "timeframe", "") or "")
+        settings = get_settings()
         policy = normalize_timeframe_entry_policy(
-            getattr(get_settings(), "ut_timeframe_entry_policy", "INCLUDE_5MIN")
+            getattr(settings, "ut_timeframe_entry_policy", "INCLUDE_5MIN")
         )
-        if policy == "PRIMARY_15" and self._is_quad_prime_raw_candidate(candidate):
+        strict = bool(getattr(settings, "strict_entry_timeframes", False))
+        if strict and timeframe not in timeframe_entry_timeframes(policy):
+            return self._gate_block(candidate, f"Strict entry policy {policy} blocks {timeframe}.")
+        if not strict and policy == "PRIMARY_15" and self._is_quad_prime_raw_candidate(candidate):
             return True
         if timeframe == "1min":
             # 2026-09-26 user: a plain 1m signal enters only when the TF toggle is 1M
@@ -30342,6 +30368,10 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return True, ""
         inst_type = str(getattr(trade, "inst_type", "") or "").upper() or "ANY"
         try:
+            block_reason = getattr(risk, "entry_block_reason", None)
+            if callable(block_reason):
+                reason = block_reason(inst_type)
+                return not reason, reason
             allowed = bool(can_trade(inst_type))
         except Exception as exc:
             return False, (
@@ -34950,7 +34980,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         }
 
     @staticmethod
-    def _historical_intel_bar_key(ts, tf: str = "5min") -> str:
+    def _historical_intel_bar_key(ts, tf: str = "5min", *, panel=False) -> str:
         """Stable replay-intelligence key for one timeframe candle.
 
         Multiple admission, evidence, and exit stages may ask for the same
@@ -34961,6 +34991,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         if timeframe not in {"1min", "5min", "15min"}:
             timeframe = "5min"
         try:
+            if panel:
+                return f"panel:{pd.Timestamp(ts).isoformat()}"
             return pd.Timestamp(ts).floor(timeframe).isoformat()
         except Exception:
             return str(ts)
@@ -34987,7 +35019,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             return str(value[0] or ""), float(value[1] or 0.0)
         return "", 0.0
 
-    def _compute_historical_intel_at(self, instrument: str, ts, tf: str = "5min"):
+    def _compute_historical_intel_at(self, instrument: str, ts, tf: str = "5min", *, panel=False):
         """Recompute intelligence score and regime at a historical timestamp.
 
         Includes only candles closed by ``ts`` (a decision availability time)
@@ -35000,7 +35032,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
         tf_key = str(tf or "5min").lower()
         if tf_key not in {"1min", "5min", "15min"}:
             tf_key = "5min"
-        ts_key = self._historical_intel_bar_key(ts, tf_key)
+        ts_key = self._historical_intel_bar_key(ts, tf_key, panel=True) if panel else self._historical_intel_bar_key(ts, tf_key)
         cache_key = (
             int(getattr(self, "simulation_id", 0) or 0),
             str(instrument or "").upper(),
@@ -35069,6 +35101,16 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                         observed_at = float(historical_chain_quality.get("recorded_at") or 0.0)
                         if 0 <= as_of_ist.timestamp() - observed_at <= 120:
                             historical_chain = recorded_chain
+                            if (historical_chain_quality.get("source") == "upstox" and
+                                    historical_chain_quality.get("intelligence_usable") is not False):
+                                recorded_expiry = str(recorded_chain.attrs.get("expiry") or "")
+                                recorded_meta = {**historical_chain_quality, "fetched_at": observed_at,
+                                                 "expiry_aligned": bool(recorded_expiry and
+                                                     recorded_expiry == historical_chain_quality.get("active_expiry") and
+                                                     historical_chain_quality.get("expiry_aligned"))}
+                                historical_chain_quality.update(Scanner._assess_chain_quality(
+                                    self, instrument, recorded_chain, recorded_meta,
+                                    as_of=as_of_ist.timestamp()))
                         else:
                             historical_chain_quality.update(intelligence_usable=False,
                                 reason="Recorded option-chain timestamp is not valid at decision time")
@@ -35162,18 +35204,19 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             if len(quality_cache) > 8192:
                 quality_cache.clear()
             quality_cache[cache_key] = availability
-            coverage = getattr(self, "_historical_intel_coverage", None)
-            if not isinstance(coverage, dict) or coverage.get("simulation_id") != cache_key[0]:
-                coverage = {"simulation_id": cache_key[0], "by_index_timeframe": {}}
-                self._historical_intel_coverage = coverage
-            tally = coverage["by_index_timeframe"].setdefault(f"{instrument}_{tf_key}", {
-                "evaluations": 0, "option_chain_available": 0, "vix_available": 0,
-                "futures_participation_available": 0, "options_participation_available": 0,
-            })
-            tally["evaluations"] += 1
-            for name in ("option_chain_available", "futures_participation_available", "options_participation_available"):
-                tally[name] += int(availability[name])
-            tally["vix_available"] += int(hist_vix_context.get("available") is True)
+            if not panel:
+                coverage = getattr(self, "_historical_intel_coverage", None)
+                if not isinstance(coverage, dict) or coverage.get("simulation_id") != cache_key[0]:
+                    coverage = {"simulation_id": cache_key[0], "by_index_timeframe": {}}
+                    self._historical_intel_coverage = coverage
+                tally = coverage["by_index_timeframe"].setdefault(f"{instrument}_{tf_key}", {
+                    "evaluations": 0, "option_chain_available": 0, "vix_available": 0,
+                    "futures_participation_available": 0, "options_participation_available": 0,
+                })
+                tally["evaluations"] += 1
+                for name in ("option_chain_available", "futures_participation_available", "options_participation_available"):
+                    tally[name] += int(availability[name])
+                tally["vix_available"] += int(hist_vix_context.get("available") is True)
             full_cache = getattr(self, "_historical_intel_result_at_cache", None)
             if not isinstance(full_cache, dict):
                 self._historical_intel_result_at_cache = {}
@@ -35194,7 +35237,8 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             cache[cache_key] = (0.0, "UNKNOWN")
             return 0.0, "UNKNOWN"
 
-    def _get_historical_intel_context_at(self, instrument: str, ts, tf: str = "5min") -> Dict[str, Any]:
+    def _get_historical_intel_context_at(self, instrument: str, ts, tf: str = "5min",
+                                          *, panel=False) -> Dict[str, Any]:
         """Full as-of intelligence for replay entries and trade management."""
         tf_key = str(tf or "5min").lower()
         if tf_key not in {"1min", "5min", "15min"}:
@@ -35203,16 +35247,35 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
             int(getattr(self, "simulation_id", 0) or 0),
             str(instrument or "").upper(),
             tf_key,
-            self._historical_intel_bar_key(ts, tf_key),
+            self._historical_intel_bar_key(ts, tf_key, panel=True) if panel else self._historical_intel_bar_key(ts, tf_key),
         )
         full_cache = getattr(self, "_historical_intel_result_at_cache", {}) or {}
         if key not in full_cache:
             # A compact score may outlive an evicted full context; recompute it
             # from the same as-of data rather than borrowing live intelligence.
             (getattr(self, "_historical_intel_at_cache", {}) or {}).pop(key, None)
-            self._compute_historical_intel_at(instrument, ts, tf_key)
+            self._compute_historical_intel_at(instrument, ts, tf_key, **({"panel": True} if panel else {}))
             full_cache = getattr(self, "_historical_intel_result_at_cache", {}) or {}
         return dict(full_cache.get(key) or {})
+
+    def _historical_panel_intel(self, instrument: str) -> Dict[str, Any]:
+        """Use the newest closed replay candle and its matching recorded inputs."""
+        five = self.candles.get_candles(instrument, "5min")
+        if five is None or five.empty:
+            return {}
+        clock = pd.Timestamp(five.index[-1]) + pd.Timedelta(minutes=5)
+        minute = self.candles.get_candles(instrument, "1min")
+        if minute is not None and not minute.empty:
+            clock = min(clock, pd.Timestamp(minute.index[-1]) + pd.Timedelta(minutes=1))
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        clock = clock.tz_localize("Asia/Kolkata") if clock.tzinfo is None else clock
+        clock = min(clock, now).floor("5min")
+        intel = self._get_historical_intel_context_at(instrument, clock, "5min", panel=True)
+        if intel:
+            intel["regime_horizons"] = self._live_regime_horizons(
+                instrument, session_context=intel.get("session_context"),
+                breadth_context=intel.get("breadth_context"), as_of=clock)
+        return intel
 
     def _compute_historical_confluence_at(self, mtf_result, ts) -> float:
         """Reconstruct MTF confluence score at a historical timestamp.
@@ -35473,7 +35536,7 @@ class Scanner(ScannerChartMixin, ScannerTelemetryMixin, ScannerRecalculationMixi
                 and str(getattr(c, "inst_type", "") or "").upper() == "OPT"
             ):
                 sym = str(getattr(c, "trading_symbol", "") or "").upper()
-                looks_option = sym.endswith("CE") or sym.endswith("PE")
+                looks_option = sym.endswith(("CE", "PE")) or any(part in {"CE", "PE"} for part in sym.split())
                 if float(getattr(c, "atm_strike", 0.0) or 0.0) <= 0 or not looks_option:
                     if not self._force_candidate_to_options(c):
                         try:

@@ -7,35 +7,33 @@ Implements the unified Broker interface with Upstox API v2:
 - Position book reconciliation normalized to system standards
 - Margin preflight checks
 - Fail-closed error handling (distinguishing ambiguous vs rejected)
-- Health and failure tracking for 30-second Angel One fallback.
+- Session, authority, and execution lease checks.
 """
 from __future__ import annotations
 
-import json
+import hashlib
+import math
 import threading
 import time
 import urllib.parse
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from loguru import logger
 
-from trading.broker import Broker, order_filled_quantity
+from trading.broker import Broker
 from trading.order_retry import BrokerOrderAmbiguous, BrokerOrderRejected
 from trading.account_execution_lease import AccountExecutionLease, lease_owner_description
-from data.upstox_auth import get_upstox_token, get_upstox_auth_status
+from data.upstox_auth import get_upstox_auth_status, get_upstox_token
 
 UPSTOX_BASE_URL = "https://api.upstox.com"
-UPSTOX_ORDER_PLACE = f"{UPSTOX_BASE_URL}/v2/order/place"
-UPSTOX_ORDER_MODIFY = f"{UPSTOX_BASE_URL}/v2/order/modify"
-UPSTOX_ORDER_CANCEL = f"{UPSTOX_BASE_URL}/v2/order/cancel"
+UPSTOX_ORDER_PLACE = "https://api-hft.upstox.com/v2/order/place"
+UPSTOX_ORDER_MODIFY = "https://api-hft.upstox.com/v2/order/modify"
+UPSTOX_ORDER_CANCEL = "https://api-hft.upstox.com/v2/order/cancel"
 UPSTOX_ORDER_BOOK = f"{UPSTOX_BASE_URL}/v2/order/retrieve-all"
-UPSTOX_ORDER_HISTORY = f"{UPSTOX_BASE_URL}/v2/order/history"
+UPSTOX_ORDER_DETAILS = f"{UPSTOX_BASE_URL}/v2/order/details"
 UPSTOX_POSITIONS = f"{UPSTOX_BASE_URL}/v2/portfolio/short-term-positions"
 UPSTOX_FUNDS = f"{UPSTOX_BASE_URL}/v2/user/get-funds-and-margin"
-
-_TERMINAL_STATUSES = {"COMPLETE", "REJECTED", "CANCELLED"}
-
 
 class UpstoxBroker(Broker):
     """Upstox API v2 Live Execution Broker."""
@@ -55,11 +53,10 @@ class UpstoxBroker(Broker):
         self._last_error_time: Optional[float] = None
         self._consecutive_failures = 0
         self._last_error_reason = ""
-        self._order_cache: Dict[str, Dict[str, Any]] = {}
 
     def acquire_execution_lease(self) -> bool:
         if self._execution_lease is None:
-            return True
+            return False
         return self._execution_lease.acquire()
 
     def execution_lease_established(self) -> bool:
@@ -71,16 +68,58 @@ class UpstoxBroker(Broker):
 
     def has_execution_lease(self) -> bool:
         lease = self._execution_lease
-        return True if lease is None else bool(lease.held)
+        return bool(lease and lease.held)
 
     def execution_lease_block_reason(self) -> str:
         lease = self._execution_lease
-        if lease is None or lease.held:
+        if lease is None:
+            return "Upstox account ID is required for the execution lease"
+        if lease.held:
             return ""
         return "REAL broker account is owned by " + lease_owner_description(lease.owner_metadata)
 
     def set_execution_authority(self, provider) -> None:
         self._execution_authority = provider
+
+    def _mutation_headers(self) -> Dict[str, str]:
+        if not callable(self._execution_authority) or not self._execution_authority():
+            raise BrokerOrderRejected("Upstox order mutation requires REAL mode")
+        if not self.has_execution_lease():
+            raise BrokerOrderRejected(self.execution_lease_block_reason())
+        if get_upstox_auth_status().get("user_id") != self.account_id:
+            raise BrokerOrderRejected("Upstox session does not match the execution lease account")
+        return self._headers()
+
+    @staticmethod
+    def order_tag(trade_id: str, leg: str = "ENTRY", attempt: int = 0) -> str:
+        identity = f"{trade_id}|{leg}|{attempt}".encode()
+        return "UT" + hashlib.blake2s(identity, digest_size=9).hexdigest()
+
+    @staticmethod
+    def _instrument_key(token: str) -> str:
+        key = str(token or "")
+        segment, separator, exchange_token = key.partition("|")
+        if separator and segment in {"NSE_FO", "BSE_FO"} and exchange_token.isdecimal():
+            return key
+        raise BrokerOrderRejected("Upstox order requires a verified NSE_FO or BSE_FO instrument key")
+
+    @staticmethod
+    def _transaction_side(side: str) -> str:
+        side = str(side).upper()
+        if side not in {"BUY", "SELL"}:
+            raise BrokerOrderRejected("Upstox order requires BUY or SELL")
+        return side
+
+    @staticmethod
+    def _tick_price(instrument_key: str, price: float, side: str) -> float:
+        from engine.expiry_manager import expiry_manager
+
+        tick = expiry_manager.upstox_tick_size(instrument_key)
+        if tick is None or not math.isfinite(tick) or tick <= 0:
+            raise BrokerOrderRejected("Upstox tick size unavailable for exact contract")
+        ticks = price / tick
+        rounded = math.floor(ticks + 1e-9) if side == "BUY" else math.ceil(ticks - 1e-9)
+        return round(max(1, rounded) * tick, 4)
 
     def _headers(self) -> Dict[str, str]:
         token = get_upstox_token()
@@ -126,6 +165,8 @@ class UpstoxBroker(Broker):
             return "I"
         return "D"
 
+    _product = _map_product
+
     def place_order(
         self,
         symbol: str,
@@ -139,20 +180,23 @@ class UpstoxBroker(Broker):
         **kwargs: Any,
     ) -> str:
         """Place an order via Upstox API v2."""
-        qty = abs(int(qty))
+        qty = int(qty)
         if qty <= 0:
             raise BrokerOrderRejected(f"Invalid quantity {qty} for {symbol}")
 
-        instrument_token = token if ("|" in token or "_" in token) else f"NSE_FO|{token}"
-        order_type = "MARKET" if price <= 0.0 else "LIMIT"
-        transaction_type = "BUY" if side.upper() == "BUY" else "SELL"
+        instrument_token = self._instrument_key(token)
+        price = float(price)
+        if not math.isfinite(price) or price < 0.0:
+            raise BrokerOrderRejected(f"Invalid order price for {symbol}")
+        order_type = "MARKET" if price == 0.0 else "LIMIT"
+        transaction_type = self._transaction_side(side)
         product = self._map_product(product_type)
 
         payload = {
             "quantity": qty,
             "product": product,
             "validity": "DAY",
-            "price": round(float(price), 2) if price > 0.0 else 0.0,
+            "price": self._tick_price(instrument_token, price, transaction_type) if price else 0.0,
             "tag": str(tag or "ut1")[:20],
             "instrument_token": instrument_token,
             "order_type": order_type,
@@ -162,13 +206,14 @@ class UpstoxBroker(Broker):
             "is_amo": False,
         }
 
+        if order_type == "MARKET":
+            payload["market_protection"] = -1
+        return self._submit_order(payload, symbol)
+
+    def _submit_order(self, payload: Dict[str, Any], symbol: str) -> str:
+        headers = self._mutation_headers()
         try:
-            resp = requests.post(
-                UPSTOX_ORDER_PLACE,
-                headers=self._headers(),
-                json=payload,
-                timeout=self.timeout,
-            )
+            resp = requests.post(UPSTOX_ORDER_PLACE, headers=headers, json=payload, timeout=self.timeout)
         except requests.Timeout as exc:
             self._record_failure(exc)
             # Timeout during placement is ambiguous: the order may have reached the exchange
@@ -178,11 +223,13 @@ class UpstoxBroker(Broker):
             raise BrokerOrderAmbiguous(f"Upstox place_order transport error for {symbol}: {exc}") from exc
 
         if resp.status_code == 200:
-            data = resp.json().get("data", {})
-            order_id = str(data.get("order_id") or "")
+            try:
+                order_id = str((resp.json().get("data") or {}).get("order_id") or "")
+            except (ValueError, AttributeError):
+                order_id = ""
             if order_id:
                 self._record_success()
-                logger.info(f"Upstox order placed: {symbol} {transaction_type} {qty} -> order_id={order_id}")
+                logger.info(f"Upstox order placed: {symbol} {payload['transaction_type']} {payload['quantity']} -> order_id={order_id}")
                 return order_id
 
         err_body = resp.text[:300]
@@ -205,12 +252,11 @@ class UpstoxBroker(Broker):
         **kwargs: Any,
     ) -> str:
         """Close an existing position by sending an opposing market/limit order."""
-        exit_side = "SELL" if side.upper() == "BUY" else "BUY"
         return self.place_order(
             symbol=symbol,
             token=token,
             qty=qty,
-            side=exit_side,
+            side=side,
             product_type=product_type,
             price=price,
             tag=tag,
@@ -222,13 +268,19 @@ class UpstoxBroker(Broker):
         try:
             resp = requests.get(UPSTOX_POSITIONS, headers=self._headers(), timeout=self.timeout)
             if resp.status_code == 200:
-                raw_positions = resp.json().get("data", []) or []
+                body = resp.json()
+                raw_positions = body.get("data")
+                if body.get("status") != "success" or not isinstance(raw_positions, list):
+                    return None
                 rows = []
                 for p in raw_positions:
                     net_qty = int(float(p.get("quantity") or 0))
                     rows.append({
                         "tradingsymbol": p.get("trading_symbol", ""),
-                        "symboltoken": p.get("instrument_token", ""),
+                        "symboltoken": p.get("instrument_token") or p.get("instrument_key", ""),
+                        "buyavgprice": float(p.get("buy_price") or 0.0),
+                        "sellavgprice": float(p.get("sell_price") or 0.0),
+                        "ltp": float(p.get("last_price") or 0.0),
                         "netqty": net_qty,
                         "buyqty": int(float(p.get("buy_quantity") or 0)),
                         "sellqty": int(float(p.get("sell_quantity") or 0)),
@@ -237,6 +289,7 @@ class UpstoxBroker(Broker):
                         "pnl": float(p.get("pnl") or 0.0),
                         "realised": float(p.get("realised_profit") or 0.0),
                         "unrealised": float(p.get("unrealised_profit") or 0.0),
+                        "product": p.get("product", ""),
                         "producttype": "INTRADAY" if p.get("product") == "I" else "CARRYFORWARD",
                     })
                 self._record_success()
@@ -252,13 +305,12 @@ class UpstoxBroker(Broker):
         if not order_id:
             return {"status": "UNKNOWN", "orderstatus": "UNKNOWN"}
 
-        url = f"{UPSTOX_ORDER_HISTORY}?order_id={urllib.parse.quote(order_id)}"
+        url = f"{UPSTOX_ORDER_DETAILS}?order_id={urllib.parse.quote(order_id)}"
         try:
             resp = requests.get(url, headers=self._headers(), timeout=self.timeout)
             if resp.status_code == 200:
-                history = resp.json().get("data", []) or []
-                if history:
-                    latest = history[0] # Upstox returns newest transition first
+                latest = resp.json().get("data")
+                if isinstance(latest, dict) and str(latest.get("order_id") or "") == order_id:
                     raw_status = str(latest.get("status") or "").upper()
                     # Normalise to standard keys
                     status_map = {
@@ -276,13 +328,13 @@ class UpstoxBroker(Broker):
                         "status": norm_status,
                         "filledshares": int(float(latest.get("filled_quantity") or 0)),
                         "filled_quantity": int(float(latest.get("filled_quantity") or 0)),
-                        "price": float(latest.get("average_price") or latest.get("price") or 0.0),
+                        "price": float(latest.get("average_price") or 0.0),
                         "average_price": float(latest.get("average_price") or 0.0),
+                        "trigger_price": float(latest.get("trigger_price") or 0.0),
                         "status_message": str(latest.get("status_message") or ""),
                         "transaction_type": latest.get("transaction_type", ""),
                         "tradingsymbol": latest.get("trading_symbol", ""),
                     }
-                    self._order_cache[order_id] = result
                     self._record_success()
                     return result
             self._record_failure(f"HTTP {resp.status_code}: {resp.text[:100]}")
@@ -290,57 +342,36 @@ class UpstoxBroker(Broker):
             self._record_failure(exc)
             logger.warning(f"Upstox get_order_status failed for {order_id}: {exc}")
 
-        return self._order_cache.get(order_id, {"status": "UNKNOWN", "orderstatus": "UNKNOWN"})
+        return {"status": "UNKNOWN", "orderstatus": "UNKNOWN"}
+
+    @classmethod
+    def _stop_parameters(cls, key: str, symbol: str, side: str, trigger_price: float) -> Dict[str, Any]:
+        trigger = float(trigger_price)
+        if not math.isfinite(trigger) or trigger <= 0:
+            raise BrokerOrderRejected("Upstox protective stop requires a positive trigger")
+        # Reuse the exchange-valid stop-limit prices used by the existing risk policy.
+        from trading.kite_broker import KiteBroker
+        kind = "OPTCE" if any(part in {"CE", "PE"} for part in symbol.upper().split()) else symbol
+        params = {"price": 0.0, **KiteBroker._protective_stop_params(kind, side, trigger)}
+        params["trigger_price"] = cls._tick_price(key, trigger, side)
+        if params["price"]:
+            params["price"] = cls._tick_price(key, params["price"], side)
+        return params
 
     def place_protective_stop(
-        self,
-        symbol: str,
-        token: str,
-        qty: int,
-        side: str,
-        trigger_price: float,
-        product_type: str = "INTRADAY",
-        tag: str = "ut1_stop",
-        **kwargs: Any,
+        self, symbol: str, token: str, qty: int, side: str, trigger_price: float,
+        product_type: str = "INTRADAY", tag: str = "", **kwargs: Any,
     ) -> Optional[str]:
-        """Place an SL-M (Stop-Loss Market) or SL protective order."""
-        qty = abs(int(qty))
-        if qty <= 0:
-            return None
-
-        instrument_token = token if ("|" in token or "_" in token) else f"NSE_FO|{token}"
-        stop_side = "SELL" if side.upper() == "BUY" else "BUY"
-        product = self._map_product(product_type)
-        trigger = round(float(trigger_price), 2)
-
+        if int(qty) <= 0:
+            raise BrokerOrderRejected("Upstox protective stop requires positive quantity")
+        side = self._transaction_side(side)
         payload = {
-            "quantity": qty,
-            "product": product,
-            "validity": "DAY",
-            "price": 0.0,
-            "tag": str(tag or "ut1_stop")[:20],
-            "instrument_token": instrument_token,
-            "order_type": "SL-M",
-            "transaction_type": stop_side,
-            "disclosed_quantity": 0,
-            "trigger_price": trigger,
-            "is_amo": False,
+            "quantity": int(qty), "product": self._map_product(product_type),
+            "validity": "DAY", "tag": tag[:20], "instrument_token": self._instrument_key(token),
+            "transaction_type": side, "disclosed_quantity": 0, "is_amo": False,
+            **self._stop_parameters(self._instrument_key(token), symbol, side, trigger_price),
         }
-
-        try:
-            resp = requests.post(UPSTOX_ORDER_PLACE, headers=self._headers(), json=payload, timeout=self.timeout)
-            if resp.status_code == 200:
-                data = resp.json().get("data", {})
-                order_id = str(data.get("order_id") or "")
-                if order_id:
-                    self._record_success()
-                    logger.info(f"Upstox protective stop placed: {symbol} trigger={trigger} -> order_id={order_id}")
-                    return order_id
-            self._record_failure(f"HTTP {resp.status_code}: {resp.text[:100]}")
-        except Exception as exc:
-            self._record_failure(exc)
-            logger.error(f"Upstox place_protective_stop error for {symbol}: {exc}")
-        return None
+        return self._submit_order(payload, symbol)
 
     def modify_protective_stop(
         self,
@@ -359,15 +390,14 @@ class UpstoxBroker(Broker):
 
         payload = {
             "order_id": order_id,
-            "quantity": abs(int(qty)),
+            "quantity": int(qty),
             "validity": "DAY",
-            "price": 0.0,
-            "order_type": "SL-M",
-            "trigger_price": round(float(trigger_price), 2),
+            **self._stop_parameters(self._instrument_key(token), symbol, self._transaction_side(side), trigger_price),
             "disclosed_quantity": 0,
         }
+        headers = self._mutation_headers()
         try:
-            resp = requests.put(UPSTOX_ORDER_MODIFY, headers=self._headers(), json=payload, timeout=self.timeout)
+            resp = requests.put(UPSTOX_ORDER_MODIFY, headers=headers, json=payload, timeout=self.timeout)
             if resp.status_code == 200:
                 self._record_success()
                 logger.info(f"Upstox stop modified: {order_id} -> trigger={trigger_price}")
@@ -383,8 +413,9 @@ class UpstoxBroker(Broker):
         if not order_id:
             return False
         url = f"{UPSTOX_ORDER_CANCEL}?order_id={urllib.parse.quote(order_id)}"
+        headers = self._mutation_headers()
         try:
-            resp = requests.delete(url, headers=self._headers(), timeout=self.timeout)
+            resp = requests.delete(url, headers=headers, timeout=self.timeout)
             if resp.status_code == 200:
                 self._record_success()
                 logger.info(f"Upstox order cancelled: {order_id}")
@@ -412,74 +443,83 @@ class UpstoxBroker(Broker):
             time.sleep(poll_seconds)
         return False
 
-    def find_working_protective_stop(
-        self,
-        symbol: str,
-        token: str,
-        side: str,
-        quantity: int,
-    ) -> Optional[str]:
-        """Find an existing open/pending stop order matching symbol and side."""
+    def _order_book(self) -> Optional[list]:
         try:
-            resp = requests.get(UPSTOX_ORDER_BOOK, headers=self._headers(), timeout=self.timeout)
-            if resp.status_code == 200:
-                orders = resp.json().get("data", []) or []
-                stop_side = "SELL" if side.upper() == "BUY" else "BUY"
-                for o in orders:
-                    status = str(o.get("status") or "").upper()
-                    if status in ("TRIGGER PENDING", "OPEN"):
-                        if o.get("transaction_type") == stop_side:
-                            t_sym = o.get("trading_symbol", "")
-                            if symbol in t_sym or t_sym in symbol:
-                                return str(o.get("order_id") or "")
-        except Exception as exc:
-            logger.warning(f"Upstox find_working_protective_stop failed: {exc}")
+            response = requests.get(UPSTOX_ORDER_BOOK, headers=self._headers(), timeout=self.timeout)
+            response.raise_for_status()
+            body = response.json()
+            if body.get("status") == "success" and isinstance(body.get("data"), list):
+                return body["data"]
+        except (requests.RequestException, ValueError, BrokerOrderRejected):
+            pass
         return None
 
+    def inspect_order_by_tag(self, tag: str) -> Dict[str, Any]:
+        orders = self._order_book() if tag else None
+        if orders is None:
+            return {"state": "UNKNOWN"}
+        matches = [row for row in orders if row.get("tag") == tag]
+        if not matches:
+            return {"state": "ABSENT"}
+        if len(matches) != 1 or not matches[0].get("order_id"):
+            return {"state": "AMBIGUOUS", "matches": matches}
+        row = matches[0]
+        return {"state": "FOUND", "order_id": row["order_id"], "order": row,
+                "status": row.get("status", ""), "matches": matches}
+
+    @staticmethod
+    def _matches_contract(row: dict, symbol: str, token: str, side: str) -> bool:
+        return (bool(token) and token == (row.get("instrument_token") or row.get("instrument_key"))
+                and symbol == row.get("trading_symbol")
+                and side.upper() == row.get("transaction_type"))
+
+    def find_working_protective_stop(
+        self, symbol: str, token: str, side: str, quantity: int = 0,
+    ) -> Optional[str]:
+        return self.inspect_working_protective_stop(symbol, token, side, quantity).get("order_id")
+
     def inspect_working_protective_stop(
-        self,
-        symbol: str,
-        token: str,
-        side: str,
-        quantity: int,
-        product_type: Optional[str] = None,
-        trigger_price: Optional[float] = None,
+        self, symbol: str, token: str, side: str, quantity: int,
+        product_type: Optional[str] = None, trigger_price: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Return full details of a working protective stop order."""
-        stop_id = self.find_working_protective_stop(symbol, token, side, quantity)
-        if not stop_id:
-            return {"order_id": "", "status": "ABSENT"}
-        st = self.get_order_status(stop_id)
-        return {
-            "order_id": stop_id,
-            "status": "WORKING",
-            "trigger_price": st.get("price") or trigger_price or 0.0,
-            "raw": st,
-        }
+        orders = self._order_book()
+        if orders is None:
+            return {"state": "UNKNOWN"}
+        matches = [row for row in orders
+                   if self._matches_contract(row, symbol, token, side)
+                   and str(row.get("status") or "").lower() in {"open", "trigger pending"}
+                   and row.get("order_type") in {"SL", "SL-M"}]
+        if not matches:
+            return {"state": "NONE"}
+        if len(matches) != 1:
+            return {"state": "AMBIGUOUS"}
+        row = matches[0]
+        try:
+            trigger = float(row.get("trigger_price") or 0)
+            if (not row.get("order_id") or not math.isfinite(trigger) or trigger <= 0
+                    or quantity <= 0 or int(row.get("quantity") or 0) != quantity
+                    or int(row.get("filled_quantity") or 0) != 0
+                    or (product_type and row.get("product") != self._map_product(product_type))):
+                return {"state": "CONFLICT"}
+        except (ValueError, TypeError):
+            return {"state": "CONFLICT"}
+        return {"state": "FOUND", "order_id": row["order_id"], "trigger_price": trigger}
 
     def inspect_recent_entry_order(
-        self,
-        symbol: str,
-        token: str,
-        side: str,
-        quantity: int,
+        self, symbol: str, token: str, side: str, quantity: int = 0, **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Inspect recent order book for matching entry order."""
-        try:
-            resp = requests.get(UPSTOX_ORDER_BOOK, headers=self._headers(), timeout=self.timeout)
-            if resp.status_code == 200:
-                orders = resp.json().get("data", []) or []
-                for o in orders:
-                    t_sym = o.get("trading_symbol", "")
-                    if (symbol in t_sym or t_sym in symbol) and o.get("transaction_type") == side.upper():
-                        return {
-                            "order_id": str(o.get("order_id") or ""),
-                            "status": str(o.get("status") or "").lower(),
-                            "filled_quantity": int(float(o.get("filled_quantity") or 0)),
-                        }
-        except Exception as exc:
-            logger.warning(f"Upstox inspect_recent_entry_order failed: {exc}")
-        return {"order_id": "", "status": "UNKNOWN"}
+        orders = self._order_book()
+        if orders is None:
+            return {"state": "UNKNOWN"}
+        matches = [row for row in orders
+                   if self._matches_contract(row, symbol, token, side)
+                   and row.get("order_type") in {"LIMIT", "MARKET"}
+                   and str(row.get("status") or "").lower() not in {"rejected", "cancelled"}
+                   and (not quantity or row.get("quantity") == quantity)]
+        if not matches:
+            return {"state": "ABSENT"}
+        # A shape match could belong to a different trade. Exact tags may recover it.
+        return {"state": "AMBIGUOUS"}
 
     def preflight_entry_margin(self, **kwargs: Any) -> Dict[str, Any]:
         """Query Upstox available funds and margin."""
@@ -500,8 +540,8 @@ class UpstoxBroker(Broker):
             logger.warning(f"Upstox preflight_entry_margin failed: {exc}")
 
         return {
-            "available_margin": 100000.0,
+            "available_margin": None,
             "used_margin": 0.0,
-            "status": "UNAVAILABLE_ASSUMED_PASS",
+            "status": "UNAVAILABLE",
             "broker": "UPSTOX",
         }

@@ -737,19 +737,14 @@ def start_runtime_watchdog(scanner: Scanner, settings) -> None:
                 else:
                     state.pop("upstox_token", None)
 
-                # 2c. Broker Failover Check (Upstox primary -> Angel One 30s fallback)
-                try:
+                status_reader = None
+                if RuntimeMode.parse(getattr(scanner, "mode", "")).permits_live_orders:
                     broker = getattr(getattr(scanner, "trades", None), "real_broker", None)
-                    if broker and hasattr(broker, "is_failover_active") and broker.is_failover_active:
-                        _alert(
-                            "broker_failover",
-                            "Primary broker Upstox down >30s; Angel One fallback active.",
-                            state,
-                        )
-                    else:
-                        state.pop("broker_failover", None)
-                except Exception:
-                    pass
+                    status_reader = getattr(broker, "execution_status", None)
+                if callable(status_reader) and not status_reader().get("connected"):
+                    _alert("angelone_execution", "Angel One execution session unavailable", state)
+                else:
+                    state.pop("angelone_execution", None)
 
                 # 4. Host memory / Windows commit pressure.  Fail closed only for NEW
                 # exposure. Do not change scanner.auto_mode: that same flag controls
@@ -791,6 +786,8 @@ def _contract_token_for(data_provider, symbol: str) -> str:
                     return token
             except Exception:
                 continue
+    if getattr(data_provider, "upstox_only", False):
+        return ""
     # MarketDataProvider deliberately exposes Kite as a composed source rather than
     # proxying every contract-master method.  The live archive provider has already
     # loaded that source, so use its exact tradingsymbol lookup before falling back to
@@ -1544,10 +1541,12 @@ def start_session_archiver_scheduler(data_provider=None):
                                 "attempted": False,
                             }
                             return False
-                        token = (
-                            session_tokens.get(symbol)
-                            or _contract_token_for(provider, symbol)
-                        )
+                        token = str(session_tokens.get(symbol) or "").strip()
+                        if getattr(provider, "upstox_only", False) is True:
+                            segment, _, contract_id = token.partition("|")
+                            if segment not in {"NSE_FO", "BSE_FO"} or not contract_id.isdecimal():
+                                token = ""
+                        token = token or _contract_token_for(provider, symbol)
                         if not token:
                             backfill_outcomes[symbol] = {
                                 "state": "retryable",
@@ -1941,10 +1940,14 @@ def create_system():
     logger.info("🚀 UT1 Index Trading System v2.0")
     logger.info("═" * 60)
 
-    # 1. Kite primary, Fyers secondary, AngelOne index-price fallback. Credentials are
-    # loaded inside the provider so secrets never travel through startup logs/arguments.
-    data_provider = MarketDataProvider(start_streams=runtime_mode().uses_live_market_data)
+    from trading.angelone_broker import AngelOneBroker
+
+    sim_broker = SignalSimBroker()
+    real_broker = AngelOneBroker(instance_id=f"UT1:{settings.dashboard_port}")
+    data_provider = MarketDataProvider(start_streams=runtime_mode().uses_live_market_data, upstox_only=True)
+    data_provider.execution_broker = real_broker
     data_provider.connect()
+    data_provider.fetch_instruments()
     if runtime_mode().permits_live_orders:
         readiness = validate_real_mode_readiness(settings, data_provider)
         if readiness.get("blockers") == ["all broker sources unavailable"]:
@@ -1969,63 +1972,20 @@ def create_system():
             except Exception as exc:
                 logger.error(f"Failed to persist HISTORICAL safe-mode fallback: {exc}")
     
-    # 1b. Broker Setup (Dual Mode)
-    sim_broker = SignalSimBroker()
-    real_broker = None
-    # Build the Kite broker even with no session yet. Gating this on a live connection
-    # was an AngelOne assumption: that login happened automatically at startup, so
-    # "not connected" meant "broker impossible". Kite's login is a manual browser step
-    # that normally happens AFTER startup, and refusing to construct the broker left
-    # the system stuck in SIGNAL SIMULATION until a full restart — the operator would
-    # log in, see a healthy dashboard, and still place no live orders.
-    # KiteBroker holds the shared auth, so the session it gets rebound at login time.
-    if True:
-        # Upstox API v2 is the PRIMARY execution broker.
-        # Angel One SmartAPI is the 30-SECOND FALLBACK broker if Upstox fails.
-        from trading.upstox_broker import UpstoxBroker
-        from trading.angelone_broker import AngelOneBroker
-        from trading.failover_broker import FailoverBroker
-        from data.upstox_auth import get_upstox_auth_status
-
-        upstox_account_id = str(getattr(settings, "upstox_user_id", "") or "7JATYL").strip()
-        upstox_broker = UpstoxBroker(
-            account_id=upstox_account_id,
-            instance_id=f"UT1:{settings.dashboard_port}",
-        )
-        angel_broker = AngelOneBroker()
-        real_broker = FailoverBroker(
-            primary=upstox_broker,
-            fallback=angel_broker,
-            failover_threshold_seconds=float(getattr(settings, "upstox_failover_threshold_seconds", 30.0) or 30.0),
-        )
-
-        auth_st = get_upstox_auth_status()
-        if not auth_st.get("authenticated"):
-            logger.warning(
-                "Upstox session required: no valid token. Complete daily login at "
-                f"http://{settings.dashboard_host}:{settings.dashboard_port}/api/upstox_login "
-                f"({auth_st.get('reason')})"
-            )
-        else:
-            logger.info("✅ Broker (Upstox API v2 LIVE Ready; Angel One 30s Fallback Armed)")
-
-        if runtime_mode().permits_live_orders and not (
-            real_broker.execution_lease_established()
-            and real_broker.acquire_execution_lease()
-        ):
-            logger.critical(
-                "REAL startup refused: " + real_broker.execution_lease_block_reason()
-            )
-            settings.trading_mode = replay_fallback()
-            try:
-                settings.save_to_env()
-            except Exception as exc:
-                logger.error(f"Failed to persist lease safe-mode fallback: {exc}")
-        data_provider.fetch_instruments()
+    if runtime_mode().permits_live_orders and not (
+        real_broker.execution_lease_established() and real_broker.acquire_execution_lease()
+    ):
+        logger.critical("REAL startup refused: " + real_broker.execution_lease_block_reason())
+        settings.trading_mode = replay_fallback()
+        try:
+            settings.save_to_env()
+        except Exception as exc:
+            logger.error(f"Failed to persist lease safe-mode fallback: {exc}")
 
     # Initial broker selection based on settings
     active_broker = real_broker if (runtime_mode().permits_live_orders and real_broker) else sim_broker
-    logger.info(f"✅ Active Broker: {'REAL' if active_broker == real_broker else 'SIGNAL SIMULATION (Real Data)'}")
+    logger.info("Market data: Upstox | Execution: {}",
+                "Angel One REAL" if active_broker is real_broker else "simulation")
 
     # 2. Candle Builder
     candle_builder = CandleBuilder(
@@ -2046,6 +2006,7 @@ def create_system():
 
     # Connect tick streams
     data_provider.on_tick = candle_builder.update_from_tick
+    data_provider.start_upstox_stream()
 
     # 3. UT Bot Multi-TF Engine
     mtf_engine = MultiTimeframeEngine(settings.get_ut_engine_params())

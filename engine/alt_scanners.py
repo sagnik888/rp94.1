@@ -48,7 +48,7 @@ def _nb_supertrend(close, upper, lower):
             trend[i] = -1
         else:
             trend[i] = trend[i - 1]
-    return trend
+    return trend, fu, fl
 
 
 class AltSignalEngine(UTBotEngine):
@@ -82,6 +82,10 @@ class AltSignalEngine(UTBotEngine):
         return np.where(ef > es, 1, -1).astype(int)
 
     def _supertrend_trend(self, df: pd.DataFrame) -> np.ndarray:
+        trend, _, _ = self._supertrend_bands(df)
+        return trend
+
+    def _supertrend_bands(self, df: pd.DataFrame):
         # ATR for the Supertrend bands is a SIMPLE moving average of True Range —
         # this is exactly what the validated 22-day benchmark used (+Rs.90k, 45% WR).
         # (Wilder/RMA ATR is the "textbook" Supertrend but produced a different, less
@@ -98,7 +102,7 @@ class AltSignalEngine(UTBotEngine):
         close_arr = close.values.astype(np.float64)
         upper = hl2 + self.st_mult * atr
         lower = hl2 - self.st_mult * atr
-        return _nb_supertrend(close_arr, upper, lower).astype(int)
+        return _nb_supertrend(close_arr, upper, lower)
 
     @staticmethod
     def _hold_through_zeros(arr: np.ndarray) -> np.ndarray:
@@ -129,36 +133,11 @@ class AltSignalEngine(UTBotEngine):
         }
         last = 0
         for i in range(n):
-            sources = []
-            if 0 <= i < len(ema):
-                sources.append(("ema", int(ema[i])))
-            if 0 <= i < len(st):
-                sources.append(("supertrend", int(st[i])))
-            if 0 <= i < len(utbot_pos):
-                sources.append(("utbot", int(utbot_pos[i])))
-            
-            # Count votes for -1, 0, 1
-            votes = {1: 0, -1: 0}
-            for name, dir_val in sources:
-                if dir_val in votes:
-                    votes[dir_val] += 1
-
-            # Determine majority
-            want = 0
-            if votes[1] > votes[-1]:
-                want = 1
-            elif votes[-1] > votes[1]:
-                want = -1
-
-            # Only flip on at least two independent primitive sources.
-            active = len([v for v in sources if v[1] != 0])
-            if last != 0:
-                opposite_votes = votes.get(-last, 0)
-                if opposite_votes >= min(2, active):
-                    last = want
-            else:
-                if want != 0:
-                    last = want
+            votes = [source[i] for source in (ema, st, utbot_pos) if i < len(source)]
+            if votes.count(1) >= 2:
+                last = 1
+            elif votes.count(-1) >= 2:
+                last = -1
             positions[i] = last
         return positions, ctx
 
@@ -169,17 +148,7 @@ class AltSignalEngine(UTBotEngine):
     def _supertrend_line(self, df: pd.DataFrame) -> list:
         """The visible Supertrend line: the active band (lower band in an uptrend,
         upper band in a downtrend). Uses the same SMA-of-TR ATR as the trend logic."""
-        high = df["high"].astype(float)
-        low = df["low"].astype(float)
-        close = df["close"].astype(float)
-        prev_close = close.shift(1)
-        tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-        atr = tr.rolling(self.st_period).mean().values.astype(np.float64)
-        hl2 = ((high + low) / 2.0).values.astype(np.float64)
-        c = close.values.astype(np.float64)
-        upper = hl2 + self.st_mult * atr
-        lower = hl2 - self.st_mult * atr
-        trend = _nb_supertrend(c, upper, lower)
+        trend, upper, lower = self._supertrend_bands(df)
         line = np.where(trend > 0, lower, upper)
         return [None if not np.isfinite(v) else round(float(v), 2) for v in line]
 
@@ -1268,7 +1237,13 @@ class AltSignalEngine(UTBotEngine):
                 utbot_pos_arr = np.asarray(result.get("positions", []), dtype=int)
                 if len(utbot_pos_arr) != len(df):
                     utbot_pos_arr = self._hold_through_zeros(np.zeros(len(df), dtype=int))
-                positions, quad_ctx = self._quad_union_consensus_positions(ema, supertrend, utbot_pos_arr)
+                # ATR has no valid Supertrend band until its rolling window fills.
+                # Keep the trigger histories intact and exclude warm-up votes from display state.
+                st_votes = supertrend.copy()
+                st_votes[:self.st_period - 1] = 0
+                ema_votes = ema.copy()
+                ema_votes[0] = 0
+                positions, _ = self._quad_union_consensus_positions(ema_votes, st_votes, utbot_pos_arr)
                 signals = []
                 for source, source_positions in (
                     ("ema", ema),
@@ -1290,6 +1265,15 @@ class AltSignalEngine(UTBotEngine):
                 for signal in utbot_signals or []:
                     signals.append(self._tag_signal(signal, "utbot"))
                 signals = self._merge_union_signals(signals)
+                directions_by_bar = {}
+                for signal in signals:
+                    directions_by_bar.setdefault(signal.bar_index, set()).add(signal.signal_type)
+                conflicts = sorted(bar for bar, directions in directions_by_bar.items() if len(directions) > 1)
+                result["conflicted_bars"] = conflicts
+                result["conflicted_signals"] = [
+                    signal for signal in signals if signal.bar_index in conflicts
+                ]
+                signals = [signal for signal in signals if signal.bar_index not in conflicts]
             elif self.signal_source == "utbot_prime":
                 # UT1 remains the sole entry trigger. EMA, Supertrend, and their
                 # consensus only annotate how much trend structure agrees at that
@@ -1382,7 +1366,8 @@ class AltSignalEngine(UTBotEngine):
             if isinstance(result.get("state"), dict):
                 result["state"]["position"] = pos
                 result["state"]["position_label"] = (
-                    "LONG" if pos == 1 else ("SHORT" if pos == -1 else "FLAT")
+                    "LONG" if pos == 1 else ("SHORT" if pos == -1 else
+                    "UNKNOWN" if self.signal_source in {"quad_union", "quad_prime"} else "FLAT")
                 )
             # Keep the engine's internal state consistent for the UT1 STATE panel.
             try:
@@ -1394,16 +1379,17 @@ class AltSignalEngine(UTBotEngine):
                 pass
             return result
         except Exception as exc:
-            # Any failure → fall back to the already-computed UT result (fail safe).
-            logger.warning(
-                "Alt signal engine failed; falling back to UT1 result "
-                "engine={} instrument={} timeframe={} error={}",
+            logger.error(
+                "ENGINE_DEGRADED engine={} instrument={} timeframe={} error={}: {}",
                 self.signal_source,
                 instrument or "-",
                 timeframe or "-",
+                type(exc).__name__,
                 exc,
             )
-            return result
+            state = dict(result.get("state") or {}, position=0, position_label="UNKNOWN")
+            return dict(result, source_engine=self.signal_source, signals=[], state=state,
+                        error="ENGINE_DEGRADED", error_type=type(exc).__name__)
 
 
 class UTEmaSignalEngine:
@@ -1485,11 +1471,13 @@ class UTEmaSignalEngine:
             self.sync_entry_timing()
             return self._native.chart_result(df=df, instrument=instrument, timeframe=timeframe, **kwargs)
 
-    def monitor_snapshot(self, lifecycle_id, entry_time=None):
+    def monitor_snapshot(self, lifecycle_id, entry_time=None, *, wait=True):
         """Copy only a held owner's protection, not every historical chart event."""
         import copy
         from engine.ut_ema_engine import market_stamp
-        with self._utema_lock:
+        if not self._utema_lock.acquire(blocking=wait):
+            return None
+        try:
             core = self._native
             if not core._stream_ready or core._timeline is None:
                 return None
@@ -1508,6 +1496,8 @@ class UTEmaSignalEngine:
                     "utema_events": events,
                     "utema_executable_event_ids": sorted(getattr(self, "_utema_executable_event_ids", set())),
                     "state": {"current_price": core._stream_rows[-1][3] if core._stream_rows else 0.}}
+        finally:
+            self._utema_lock.release()
 
     def get_state(self, key: str = ""):
         from types import SimpleNamespace

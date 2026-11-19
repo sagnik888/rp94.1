@@ -324,7 +324,7 @@ def validate_real_mode_readiness(
     if not env_path.exists():
         blockers.append(".env missing")
 
-    # Primary broker execution is Upstox API v2 with Angel One 30s Fallback.
+    # Upstox supplies market data. The bound execution broker proves account readiness separately.
     for key in ("upstox_api_key", "upstox_api_secret"):
         if not str(getattr(settings, key, "") or "").strip():
             blockers.append(f"{key} missing")
@@ -336,12 +336,25 @@ def validate_real_mode_readiness(
         blockers.append(f"Upstox session state unavailable: {exc}")
         upstox_status = {}
     if upstox_status:
+        configured_account = str(getattr(settings, "upstox_user_id", "") or "").strip()
+        if configured_account and upstox_status.get("connected") and upstox_status.get("user_id") != configured_account:
+            blockers.append("Upstox session account differs from configured market-data account")
         if upstox_status.get("auth_required") or not upstox_status.get("connected"):
             blockers.append(
                 "Upstox daily login required"
                 + (f" ({upstox_status.get('reason')})" if upstox_status.get("reason") else "")
                 + " - complete it at /api/upstox_login"
             )
+
+    execution_broker = getattr(data_provider, "execution_broker", None)
+    if execution_broker is None and getattr(data_provider, "upstox_only", False) is True:
+        blockers.append("Angel One execution broker unavailable")
+    elif execution_broker is not None:
+        try:
+            if not execution_broker.ready_for_execution():
+                blockers.append("Angel One execution session, position book, or order contract directory unavailable")
+        except Exception as exc:
+            blockers.append(f"Angel One execution readiness could not be verified ({type(exc).__name__})")
 
     risk_summary_fn = getattr(settings, "risk_configuration_summary", None)
     if callable(risk_summary_fn):
@@ -368,7 +381,7 @@ def validate_real_mode_readiness(
                 blockers.append("all broker sources unavailable")
             if health.get("broker_degraded"):
                 warnings.append("broker source degraded")
-            if health.get("kite_stream_stalled"):
+            if health.get("kite_stream_stalled") and not getattr(data_provider, "upstox_only", False):
                 age = health.get("kite_tick_age_seconds")
                 warnings.append(
                     "Kite tick stream stalled"
@@ -436,10 +449,7 @@ def validate_real_mode_readiness(
     # rejection per signal. Warn rather than block: margin moves intraday and a stale
     # reading must not veto a session the operator can still fund.
     try:
-        from trading.upstox_broker import UpstoxBroker as _UB
-
-        _probe = _UB()
-        _cash = _probe.available_funds()
+        _cash = execution_broker.available_funds() if execution_broker is not None else None
         _floor, _detail = cheapest_one_lot_cost(settings, active_indices=active_indices)
         if _cash is not None and _floor > 0 and _cash < _floor:
             warnings.append(

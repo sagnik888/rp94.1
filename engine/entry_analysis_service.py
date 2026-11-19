@@ -589,6 +589,10 @@ class EntryAnalysisService:
         quote_label, quote_session, is_preopen, preopen_settlement = scanner._dashboard_quote_session(
             market_quote
         )
+        display_intel = intel_result
+        panel = getattr(scanner, "_historical_panel_intel", None)
+        if historical_mode and callable(panel):
+            display_intel = panel(name)
 
         ui_data = {
             'trade_state': {
@@ -608,17 +612,13 @@ class EntryAnalysisService:
                 "state_15min": mtf_result.results_15min.get("state") if mtf_result.results_15min else None,
             },
             "intelligence": {
-                "volume": intel_result.get("volume", {}),
-                "oi": intel_result.get("oi", {}),
-                "pcr": intel_result.get("pcr", {}),
-                "greeks": intel_result.get("greeks", {}),
-                "regime": intel_result.get("regime", {}),
-                "order_flow": intel_result.get("order_flow", {}),
-                "aggregate": intel_result.get("aggregate", {}),
-                "market_structure": intel_result.get("market_structure", {}),
-                "aroon": intel_result.get("aroon_context", {}),
-                "wavetrend": intel_result.get("wavetrend", {}),
-                "max_pain": intel_result.get("max_pain", {}),
+                **{key: display_intel.get(key, {}) for key in (
+                    "volume", "option_volume", "oi", "pcr", "greeks", "regime",
+                    "regime_horizons", "order_flow", "aggregate", "market_structure",
+                    "wavetrend", "max_pain", "data_quality", "session_context",
+                )},
+                "aroon": display_intel.get("aroon_context", {}),
+                "as_of": display_intel.get("as_of"),
                 "potential_rr": primary_candidate.rr if primary_candidate else 1.5,
             },
             "pre_candle_prediction": pre_candle_prediction,

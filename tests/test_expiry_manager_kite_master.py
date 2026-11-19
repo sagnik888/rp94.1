@@ -32,6 +32,10 @@ def _kite_row(**over):
 @pytest.fixture
 def staged(monkeypatch):
     """Stage a fake Kite dump through the real translation path."""
+    from config.settings import get_settings
+
+    monkeypatch.setattr(get_settings(), "kite_api_key", "fixture-key")
+
     def _build(rows_by_exchange):
         class _Source:
             def __init__(self, auth=None, kite=None):

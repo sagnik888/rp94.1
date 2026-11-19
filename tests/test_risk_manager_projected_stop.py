@@ -103,3 +103,24 @@ def test_closed_pnl_cache_invalidates_when_non_live_row_becomes_live():
 
     assert manager.check_circuit_breaker() is True
     assert manager.daily_loss_breached is True
+
+
+def test_broker_only_position_blocks_new_entries_without_triggering_loss_exit():
+    trades = _Trades({"owned": _open_trade(lots=1, lot_size=50)})
+    trades.orphan_positions = {
+        "BANKNIFTY 61000 PE 29 DEC 26": {"netqty": 30, "producttype": "CARRYFORWARD"},
+    }
+    risk = RiskManager(trades, 1_000_005)
+    risk.update_settings(capital_fut=490_000, capital_opt=500_000, risk_opt_pct=9.0)
+
+    assert risk.check_circuit_breaker() is False
+    assert not risk.daily_loss_breached and not risk.opt_loss_breached
+    assert not risk.can_trade("ANY")
+    assert "requires reconciliation" in risk.entry_block_reason("OPT")
+    assert trades.closed == []
+
+    trades.orphan_positions.clear()
+    assert risk.can_trade("OPT")
+    trades.closed_trades.append(_closed_trade(pnl=-40_000))
+    assert risk.check_circuit_breaker() is True
+    assert trades.closed == [("owned", 100.0, "GLOBAL_DAILY_LOSS_LIMIT")]

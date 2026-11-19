@@ -18,7 +18,8 @@ from data.constituent_volume import CONSTITUENT_SESSION_CLOSE, ConstituentVolume
 class KiteAngelMigration:
     _replacement_epoch = staticmethod(AngelReadOnlyCapabilities.exchange_epoch)
     def _initialize_replacement(self, settings):
-        self._market_data_route = str(getattr(settings, "supplementary_market_data", "fyers"))
+        self._market_data_route = ("upstox" if getattr(self, "upstox_only", False)
+                                   else str(getattr(settings, "supplementary_market_data", "fyers")))
         self._replacement_settings = settings
         self._replacement_lock = threading.RLock()
         self._replacement_history = {}
@@ -33,13 +34,15 @@ class KiteAngelMigration:
         self._constituent_volume = ConstituentVolumeService(settings.constituent_membership_file) if self._replacement_enabled() else None
 
     def _replacement_enabled(self):
-        return getattr(self, "_market_data_route", "fyers") in {"upstox", "upstox_angel", "kite_angel", "angel_fyers"}
+        if getattr(self, "upstox_only", False):
+            return False
+        return getattr(self, "_market_data_route", "fyers") in {"upstox_angel", "kite_angel", "angel_fyers"}
 
     def _fyers_backup_enabled(self):
         return getattr(self, "_market_data_route", "fyers") == "angel_fyers"
 
     def _fyers_enabled(self):
-        return not self._replacement_enabled() or self._fyers_backup_enabled()
+        return getattr(self, "_market_data_route", "fyers") in {"fyers", "angel_fyers"}
 
     def _angel_supplementary_quote(self, symbol):
         source = getattr(self, "angel_index", None)

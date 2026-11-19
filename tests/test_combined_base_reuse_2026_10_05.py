@@ -1,7 +1,6 @@
 """Combined base observations retain their standalone dependency and age semantics."""
 import math
-from pathlib import Path
-
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -16,9 +15,20 @@ import engine.ut_smart_engine as uts_module
 
 @pytest.fixture(scope="module")
 def saved_frames():
-    root = Path(__file__).resolve().parents[1] / "data_store/candles"
-    return {tf: pd.read_csv(root / f"NIFTY_{tf}.csv", index_col=0, parse_dates=True)
-            .loc[:"2026-09-30 15:00"].tail(900) for tf in ("1min", "5min", "15min")}
+    sessions = pd.bdate_range(end="2026-09-30", periods=40)
+    frames = {}
+    for minutes in (1, 5, 15):
+        stamps = [bar for day in sessions for bar in pd.date_range(
+            day + pd.Timedelta(hours=9, minutes=15),
+            day + pd.Timedelta(hours=15), freq=f"{minutes}min")]
+        index = pd.DatetimeIndex(stamps[-900:])
+        i = np.arange(len(index))
+        close = 25_000 + i / 7 + 35 * np.sin(i / 11)
+        frames[f"{minutes}min"] = pd.DataFrame({
+            "open": close - 1, "high": close + 4, "low": close - 4,
+            "close": close, "volume": 1000 + i % 20,
+        }, index=index)
+    return frames
 
 
 def make_pipeline(monkeypatch, mode, saved_frames, *, timeframe="5min", fire="confirmed", intrabar=False):
@@ -143,6 +153,7 @@ def test_base_required_recomputations_preserve_native_invalidation(monkeypatch, 
         row = frames["5min"].iloc[[-1]].copy(deep=True)
         row.index += pd.Timedelta(minutes=5)
         frames["5min"] = pd.concat([frames["5min"], row])
+        clock[0] += 300.0
     elif mutation == "reset_results":
         pipeline._result_cache.clear()
     elif mutation == "reset_params":

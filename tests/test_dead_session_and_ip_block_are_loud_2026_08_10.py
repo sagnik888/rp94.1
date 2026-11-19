@@ -1,16 +1,8 @@
 """Three ways a dead broker session stayed quiet.
 
-1. THE REAL HOT-SWAP TRUSTED A LATCH AND LOGGED A FALSE SUCCESS.
-   `configure(mode="REAL")` gated its reconnect on `self.data.is_connected`, a plain
-   attribute assigned at connect()/rebind_kite() and never revoked. After a mid-session
-   token death it is stale-True, so the reconnect was skipped, KiteBroker was built
-   around `kite=kite_auth.kite` — which is None — and the log said "Dynamic Kite broker
-   connection successful" while every entry and every protective exit was refused
-   terminally by _require_api.
-
-   Now the authority is asked directly (kite_auth.kite), the reconnect is attempted
-   whenever it is None, and NO broker is constructed when it stays None. A KiteBroker
-   around None accepts orders and refuses all of them, which reads as a working REAL mode.
+1. REAL HOT-SWAP MUST RECHECK THE CURRENT DATA AND EXECUTION SESSIONS.
+   The legacy connection latch can go stale. Validate Upstox authentication
+   and Angel One execution readiness before arming REAL.
 
 2. THE OPERATOR'S REPAINT-DEFER CAPS WERE INERT ON REAL MONEY.
    `_repaint_absent_checks` / `_repaint_first_absent_at` were written only on session
@@ -40,53 +32,13 @@ from scanner import Scanner
 
 # ── 1. no broker is built around a dead session ──────────────────────────────
 
-def _configure_src():
-    src = inspect.getsource(Scanner.configure)
-    marker = "REAL BROKER INITIALIZATION"
-    assert marker in src, "the dynamic REAL broker block moved"
-    start = src.index(marker)
-    # Marker-to-marker, not a char window: the block grew past a fixed slice once
-    # already and the tests silently stopped covering the branch they name.
-    end_marker = "Claim the cross-process account lease"
-    end = src.index(end_marker, start) if end_marker in src[start:] else len(src)
-    return src[start:end]
-
-
-def test_the_reconnect_no_longer_gates_on_the_stale_latch():
-    block = _configure_src()
-    assert "if kite_auth.kite is None or not self.data.is_connected:" in block, (
-        "the reconnect still trusts a flag that is never revoked"
+def test_configure_checks_current_sessions_before_activating_the_broker():
+    source = inspect.getsource(Scanner.configure)
+    assert source.index("validate_real_mode_readiness(") < source.index(
+        "self.trades.broker = self.trades.real_broker"
     )
+    assert "KiteBroker(" not in source and "UpstoxBroker(" not in source
 
-
-def test_the_broker_is_built_only_on_a_live_session():
-    block = _configure_src()
-    assert "if kite_auth.kite is not None:" in block
-    build = block.index("KiteBroker(")
-    gate = block.index("if kite_auth.kite is not None:")
-    assert gate < build, "KiteBroker is still constructed before the session is proven"
-
-
-def test_the_success_log_sits_inside_the_live_branch():
-    block = _configure_src()
-    ok = block.index("Dynamic Kite broker connection successful")
-    gate = block.index("if kite_auth.kite is not None:")
-    assert gate < ok, "the success line can still fire on a dead session"
-
-
-def test_the_dead_session_branch_names_the_login_url():
-    block = _configure_src()
-    assert "/api/kite_login" in block
-
-
-def test_the_latch_itself_was_not_repurposed():
-    """data.is_connected is read in ~12 places and assigned in 4; converting it to a
-    property would break every assignment. It is consulted, not replaced."""
-    block = _configure_src()
-    assert "self.data.is_connected" in block
-
-
-# ── 2. the defer counters live on the Trade ──────────────────────────────────
 
 def _tracker_src():
     return inspect.getsource(Scanner._track_repaint_until_candle_close)

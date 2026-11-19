@@ -860,9 +860,14 @@ class MultiTimeframeEngine:
                         lot_size=lot_size,
                         **extra,
                     )
-                    if combined and res.get("error"):
-                        raise RuntimeError("All native scanner lanes failed: " + str(res["error"]))
                     tf_results[tf] = res
+                    if res.get("error"):
+                        result_meta = self._invalidate_result(key, "processing_error", str(res["error"]))
+                        result.timeframe_metadata[tf] = {
+                            "status": "processing_error", "input": input_meta, "result": dict(result_meta),
+                            "used_cache": False, "signal_source": str(getattr(engine, "signal_source", "") or ""),
+                        }
+                        continue
                     self._result_cache[key] = res
                     self._data_hash[key] = new_hash
                     result_meta = self._record_result(key, new_hash)
@@ -965,7 +970,7 @@ class MultiTimeframeEngine:
 
         for tf, weight in self.tf_weights.items():
             res = tf_results.get(tf)
-            if res and res.get("state"):
+            if res and not res.get("error") and res.get("state"):
                 pos = res["state"]["position"]
                 trending = res["state"].get("is_trending", False)
 

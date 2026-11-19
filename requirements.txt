@@ -18,6 +18,7 @@ websockets==16.0
 Jinja2==3.1.6
 
 # Broker/data APIs
+upstox-python-sdk==2.23.0
 # Price-only tertiary index quote source. It never owns orders or volume.
 smartapi-python==1.5.5
 kiteconnect==5.2.1

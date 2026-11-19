@@ -60,3 +60,41 @@ def test_live_history_merge_yields_to_scanner_loop(monkeypatch, warm_history):
         assert phases[0][0][0] == "history_fetch_ms"
 
     asyncio.run(run())
+
+
+def test_warm_upstox_minute_refresh_publishes_holes_behind_latest_tick(monkeypatch):
+    frame = pd.DataFrame({"close": 100.0},
+                         index=pd.date_range("2026-11-19 13:00", periods=30, freq="min"))
+    requested_days, merged = [], []
+
+    async def no_delay(*args):
+        pass
+
+    def fetch(*args, days_back, **kwargs):
+        requested_days.append(days_back)
+        return frame
+
+    def merge(name, data, timeframe, *, mark_receipt):
+        assert mark_receipt is False
+        merged.append(data)
+
+    monkeypatch.setattr(asyncio, "sleep", no_delay)
+
+    async def run():
+        scanner = SimpleNamespace(
+            mode="REAL", backtest_days=30,
+            _api_semaphore=asyncio.Semaphore(1),
+            _history_rate_limiter=SimpleNamespace(consume=no_delay),
+            data=SimpleNamespace(upstox_only=True, get_historical_candles=fetch),
+            candles=SimpleNamespace(get_candle_count=lambda *_: 600,
+                                    latest_candle_time=lambda *_: pd.Timestamp("2026-11-19 13:31"),
+                                    update_candles=merge),
+            _set_candle_history_capacity=lambda **_k: None,
+            _record_scan_phase_ms=lambda *a, **k: None,
+        )
+        await Scanner._fetch_one(scanner, "NIFTY", {"token": "1", "exchange": "NSE"}, "1min",
+                                 intraday_refresh=True)
+
+    asyncio.run(run())
+    assert requested_days == [0]
+    pd.testing.assert_frame_equal(merged[0], frame)

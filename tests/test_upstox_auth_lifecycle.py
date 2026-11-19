@@ -2,6 +2,7 @@
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,56 @@ from data.upstox_auth import (
     next_token_expiry,
     read_upstox_env,
 )
+
+
+def test_upstox_reads_fresh_oauth_config(tmp_path, monkeypatch):
+    from config import settings
+    from data import upstox_auth
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("UPSTOX_API_KEY=file-key  # registered app\n"
+                        "UPSTOX_API_SECRET='file-secret'\n"
+                        "UPSTOX_REDIRECT_URI=http://localhost:8500/\n", encoding="utf-8-sig")
+    monkeypatch.setattr(upstox_auth, "ROOT", tmp_path)
+    monkeypatch.setattr(settings, "get_settings", lambda: MagicMock(
+        upstox_api_key="cached-key", upstox_api_secret="cached-secret",
+        upstox_redirect_uri="http://127.0.0.1:8500/api/upstox/callback", upstox_user_id="",
+    ))
+    for key in ("UPSTOX_API_KEY", "UPSTOX_API_SECRET", "UPSTOX_REDIRECT_URI", "UPSTOX_ACCESS_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    auth = UpstoxAuth(tmp_path / "token.json")
+
+    params = parse_qs(urlsplit(auth.login_url()).query)
+    assert params["client_id"] == ["file-key"]
+    assert params["redirect_uri"] == ["http://localhost:8500/"]
+    assert read_upstox_env()["UPSTOX_API_SECRET"] == "file-secret"
+
+    monkeypatch.setenv("UPSTOX_API_KEY", "deployment-key")
+    assert parse_qs(urlsplit(auth.login_url()).query)["client_id"] == ["deployment-key"]
+
+
+def test_upstox_uses_one_exchange_with_the_authorization_redirect(tmp_path, monkeypatch):
+    from data import upstox_auth
+    import pytest
+
+    uri = "http://localhost:8500/"
+    monkeypatch.setattr(upstox_auth, "read_upstox_env", lambda: {
+        "UPSTOX_API_KEY": "configured-key",
+        "UPSTOX_API_SECRET": "configured-secret",
+        "UPSTOX_REDIRECT_URI": uri,
+    })
+    auth = UpstoxAuth(tmp_path / "token.json")
+    response = MagicMock(status_code=401)
+    response.json.return_value = {"errors": [{"errorCode": "UDAPI100068"}]}
+    post = MagicMock(return_value=response)
+    monkeypatch.setattr(upstox_auth.requests, "post", post)
+    monkeypatch.setattr(auth, "has_valid_token", lambda: True)
+
+    params = parse_qs(urlsplit(auth.login_url()).query)
+    with pytest.raises(RuntimeError, match="UDAPI100068"):
+        auth.complete_login("single-use-code")
+    post.assert_called_once()
+    assert post.call_args.kwargs["data"]["redirect_uri"] == params["redirect_uri"][0] == uri
 
 
 class TestUpstoxAuthLifecycle(unittest.TestCase):

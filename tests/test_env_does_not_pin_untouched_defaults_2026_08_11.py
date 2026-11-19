@@ -122,6 +122,19 @@ def test_inert_settings_are_still_skipped(capture, monkeypatch):
         assert name.upper() not in capture.written
 
 
+def test_runtime_settings_save_preserves_upstox_oauth_rotation(capture, monkeypatch):
+    values = {
+        "UPSTOX_API_KEY": "rotated-key",
+        "UPSTOX_API_SECRET": "rotated-secret",
+        "UPSTOX_REDIRECT_URI": "http://localhost:8500/",
+        "UPSTOX_USER_ID": "configured-account",
+    }
+    _existing(monkeypatch, values)
+    settings = Settings(upstox_api_key="stale-key", upstox_api_secret="stale-secret")
+    settings.save_to_env()
+    assert values.keys().isdisjoint(capture.written)
+
+
 def test_list_values_still_serialise_as_json(capture, monkeypatch):
     _existing(monkeypatch, {})
     s = Settings()

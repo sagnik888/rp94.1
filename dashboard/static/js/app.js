@@ -599,7 +599,7 @@ function mergeDashboardData(current, incoming) {
 
 function isLightweightDashboardDelta(delta) {
     if (!delta || typeof delta !== 'object') return false;
-    const heavyKeys = ['instruments', 'trades', 'activity_log', 'config', 'diagnostics', 'gateway_status'];
+    const heavyKeys = ['instruments', 'trades', 'activity_log', 'config', 'diagnostics', 'gateway_status', 'mode', 'runtime_mode'];
     return !heavyKeys.some(key => Object.prototype.hasOwnProperty.call(delta, key));
 }
 
@@ -695,7 +695,7 @@ function updateDashboard(data) {
 
     // ══ SYNC GATEWAY STATUS ══
     if (data.gateway_status) {
-        updateGatewayStatus(data.gateway_status);
+        updateGatewayStatus(data.gateway_status, data.mode || data.runtime_mode);
     }
     updateDiagnosticsPanel(data.diagnostics || {});
     
@@ -1895,8 +1895,8 @@ function updateRegimeMoodPanel(intel, config) {
         direction: regime.direction || '',
     };
     _fillRegimeHorizonRow('rhPulse', 'moodMinute', 'moodMinuteMeta', pulse.regime ? pulse : fallbackSnap);
-    _fillRegimeHorizonRow('rhHour', 'moodHour', 'moodHourMeta', hour.regime ? hour : fallbackSnap);
-    _fillRegimeHorizonRow('rhDay', 'moodDay', 'moodDayMeta', day.regime ? day : fallbackSnap);
+    _fillRegimeHorizonRow('rhHour', 'moodHour', 'moodHourMeta', hour);
+    _fillRegimeHorizonRow('rhDay', 'moodDay', 'moodDayMeta', day);
 
     // Keep hidden stubs quiet if other code still writes them.
     setText('intelRegime', _regimePlainName(primaryCode));
@@ -1920,6 +1920,12 @@ function updateDivergenceAlert(intel) {
         : '';
 }
 
+function intelNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+}
+
 function updateIntelPanel(inst, data) {
     if (!inst) return;
     const intel = _resolveInstrumentIntel(inst, data);
@@ -1936,6 +1942,15 @@ function updateIntelPanel(inst, data) {
     const profile = intel.market_structure || vol.market_structure_profile || {};
     const aroon = intel.aroon || vol.aroon || {};
     const wavetrend = intel.wavetrend || vol.wavetrend || {};
+    const optionVolume = intel.option_volume || {};
+    const optionQuantity = intelNumber(optionVolume.quantity);
+    const optionVolumeAvailable = optionVolume.available === true && optionQuantity !== null && optionQuantity >= 0;
+    const asOf = typeof intel.as_of === 'number' ? new Date(intel.as_of * 1000) : new Date(intel.as_of || '');
+    const replay = String(data?.mode || '').toUpperCase() === 'HISTORICAL';
+    const snapshotTime = Number.isFinite(asOf.getTime()) ? asOf.toLocaleString('en-IN', {
+        timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+    }) : '';
+    setText('intelDataAsOf', snapshotTime ? `${replay ? 'Replay' : 'As of'} · ${snapshotTime}` : 'Waiting for data');
 
     const hasTrustedRelativeVolume = Number(vol.volume_confidence || 0) >= 75 && Number(vol.time_of_day_avg_volume || 0) > 0;
     const rawVolRatio = vol.display_volume_ratio !== undefined
@@ -1945,10 +1960,11 @@ function updateIntelPanel(inst, data) {
     // zero because index spot candles commonly do not carry traded volume.
     const volAvailable = vol.available === true && String(vol.status || '').toUpperCase() !== 'UNAVAILABLE';
     const volRatio = Number(rawVolRatio !== undefined && rawVolRatio !== null ? rawVolRatio : NaN);
-    setText('intelVolRatio', volAvailable && Number.isFinite(volRatio) ? `${volRatio.toFixed(1)}x` : '--');
+    setText('intelVolRatio', volAvailable && Number.isFinite(volRatio) ? `${volRatio.toFixed(1)}x`
+        : (optionVolumeAvailable ? compactNumber(optionQuantity) : '--'));
     const volSurge = titleCaseToken(vol.surge_level || 'NORMAL');
     const buyPct = Number(vol.buy_pct !== undefined ? vol.buy_pct : 50);
-    let volLabelText = volAvailable ? 'BALANCED' : 'NO VOLUME DATA';
+    let volLabelText = volAvailable ? 'BALANCED' : (optionVolumeAvailable ? 'OPTIONS SESSION VOLUME' : 'VOLUME UNAVAILABLE');
     if (volAvailable && buyPct > 50.5) {
         volLabelText = `${volSurge} ${buyPct.toFixed(0)}% BUY`;
     } else if (volAvailable && buyPct < 49.5) {
@@ -1979,9 +1995,11 @@ function updateIntelPanel(inst, data) {
     if (volFrameEl) {
         volFrameEl.textContent = volAvailable && volFrame
             ? (volBarStamp ? `${volFrame} · bar ${volBarStamp}` : volFrame)
-            : '';
+            : (optionVolumeAvailable ? 'Options' : '');
     }
-    setElementTitle('intelVolRatio', volAvailable ? `${volMetricName} ratio ${volRatio.toFixed(2)}x (${volBasis}) on the ${volFrame || 'analysis'} frame${volBarStamp ? `, last complete bar ${volBarStamp}` : ''}. Current ${compactNumber(vol.current_volume)} vs avg ${compactNumber(vol.avg_volume)} for that frame. Trend: ${normalizeToken(vol.volume_trend || 'unknown')}. Confidence: ${vol.volume_confidence || 0}.${volClipNote}${profileSummary}` : `Volume unavailable: ${vol.reason || 'missing or zero OHLCV volume'}.`);
+    setElementTitle('intelVolRatio', volAvailable ? `${volMetricName} ratio ${volRatio.toFixed(2)}x (${volBasis}) on the ${volFrame || 'analysis'} frame${volBarStamp ? `, last complete bar ${volBarStamp}` : ''}. Current ${compactNumber(vol.current_volume)} vs avg ${compactNumber(vol.avg_volume)} for that frame. Trend: ${normalizeToken(vol.volume_trend || 'unknown')}. Confidence: ${vol.volume_confidence || 0}.${volClipNote}${profileSummary}`
+        : (optionVolumeAvailable ? `Upstox call and put traded quantity for expiry ${optionVolume.expiry || 'shown'}.`
+            : `Volume unavailable: ${vol.reason || 'no recorded volume'}.`));
     
     const volBar = document.getElementById('intelVolBar');
     if (volBar) {
@@ -1998,25 +2016,27 @@ function updateIntelPanel(inst, data) {
     }
     
     const oiAvailable = oi.available === true && String(oi.status || '').toUpperCase() !== 'UNAVAILABLE';
-    const absOi = Number(oi.absolute_oi_change);
-    const oiVal = oiAvailable
-        ? (Number.isFinite(absOi) && absOi > 0 ? compactNumber(absOi) : titleCaseToken(oi.activity || 'NO FRESH OI'))
-        : '--';
+    const absOi = intelNumber(oi.absolute_oi_change);
+    const callOi = intelNumber(oi.total_call_oi);
+    const putOi = intelNumber(oi.total_put_oi);
+    const oiMeasuredChange = oi.change_comparable === true && absOi > 0;
+    const oiVal = !oiAvailable ? '--' : (oiMeasuredChange ? compactNumber(absOi)
+        : (callOi !== null && putOi !== null ? compactNumber(callOi + putOi) : '--'));
     setText('intelOI', oiVal);
     const oiLabel = oiAvailable
-        ? (oi.activity === 'NO_CONFIRMED_OI_CHANGE' ? 'NO FRESH OI' : (oi.signal || 'NEUTRAL'))
+        ? (oiMeasuredChange ? 'OI CHANGE' : 'TOTAL OPEN INTEREST')
         : 'OPTIONS DATA UNAVAILABLE';
     setHtml(document.getElementById('intelOILabel'), getSentimentBadge(oiLabel));
-    setElementTitle('intelOI', oiAvailable ? `${titleCaseToken(oi.activity || 'OI unknown')}. Net OI ${compactNumber(oi.net_oi_change)}; support ${oi.support_level || '--'}; resistance ${oi.resistance_level || '--'}; basis ${normalizeToken(oi.analysis_basis || 'unknown')}.` : `OI unavailable: ${oi.reason || dataQuality.reason || 'option chain unavailable'}.`);
+    setElementTitle('intelOI', oiAvailable ? `Call OI ${compactNumber(callOi)}; put OI ${compactNumber(putOi)}; support ${oi.support_level || '--'}; resistance ${oi.resistance_level || '--'}; basis ${normalizeToken(oi.analysis_basis || 'unknown')}.` : `OI unavailable: ${dataQuality.reason || oi.reason || 'option chain unavailable'}.`);
     
     // PCR also requires an explicit authoritative-data acknowledgement.  Empty
     // objects and one-strike contract-lookup fallbacks are not PCR observations.
     const pcrAvailable = pcr.available === true && String(pcr.status || '').toUpperCase() !== 'UNAVAILABLE';
-    const primaryPcr = Number(pcr.primary_pcr ?? pcr.pcr_value ?? pcr.pcr_oi);
+    const primaryPcr = intelNumber(pcr.primary_pcr ?? pcr.pcr_value ?? pcr.pcr_oi);
     setText('intelPCR', pcrAvailable && Number.isFinite(primaryPcr) ? primaryPcr.toFixed(2) : '--');
     const pcrSignal = pcrAvailable ? normalizeToken(pcr.contrarian_signal || pcr.signal || pcr.sentiment || 'NEUTRAL') : 'OPTIONS DATA UNAVAILABLE';
     setHtml(document.getElementById('intelPCRLabel'), getSentimentBadge(pcrSignal));
-    setElementTitle('intelPCR', pcrAvailable ? `${pcr.interpretation || 'PCR contrarian sentiment.'} Basis: ${normalizeToken(pcr.pcr_basis || 'unknown')} across ${pcr.near_strike_count || 0} strikes.` : `PCR unavailable: ${pcr.reason || dataQuality.reason || 'option chain unavailable'}.`);
+    setElementTitle('intelPCR', pcrAvailable ? `${pcr.interpretation || 'PCR contrarian sentiment.'} Basis: ${normalizeToken(pcr.pcr_basis || 'unknown')}.` : `PCR unavailable: ${dataQuality.reason || pcr.reason || 'option chain unavailable'}.`);
     
     // Regime tile: 3 live horizons only (1–5m / hour / day). No ADX/ER/RSI/VWAP here.
     try {
@@ -2024,7 +2044,7 @@ function updateIntelPanel(inst, data) {
     } catch (e) { /* non-fatal */ }
 
     const flowAvailable = flow.available === true && String(flow.source || '').toLowerCase() !== 'unavailable';
-    const flowRatio = Number(flow.buy_sell_ratio ?? flow.ratio);
+    const flowRatio = intelNumber(flow.buy_sell_ratio ?? flow.ratio);
     setText('intelFlow', flowAvailable && Number.isFinite(flowRatio) ? `${flowRatio.toFixed(2)}x` : '--');
     const flowConfirm = flowAvailable
         ? (flow.multi_source_flow?.confirmation || flow.signal || 'NEUTRAL')
@@ -2039,11 +2059,14 @@ function updateIntelPanel(inst, data) {
     if (maxPain.distance_pct !== undefined && maxPain.distance_pct !== null) {
         setText('intelMaxPainLabel', `${formatSignedPct(maxPain.distance_pct)} from spot`);
         setElementTitle('intelMaxPain', `Expiry magnet based on lowest option-buyer payout. Spot is ${formatSignedPct(maxPain.distance_pct)} from max pain.`);
+    } else {
+        setText('intelMaxPainLabel', 'Expiry magnet unavailable');
+        setElementTitle('intelMaxPain', dataQuality.reason || 'Option-chain OI unavailable');
     }
 
     // VWAP lives inside Regime metrics (standalone VWAP tile removed).
-    const vwapDev = Number(vol.vwap_deviation_pct);
-    const scVwap = Number((intel.session_context || {}).vwap_deviation_pct);
+    const vwapDev = intelNumber(vol.vwap_deviation_pct);
+    const scVwap = intelNumber((intel.session_context || {}).vwap_deviation_pct);
     const vwapShow = Number.isFinite(vwapDev)
         ? formatSignedPct(vwapDev)
         : (Number.isFinite(scVwap) ? formatSignedPct(scVwap) : (tradeState.vwap_deviation || '--'));
@@ -2058,7 +2081,9 @@ function updateIntelPanel(inst, data) {
             + `Engine VWAP ${vol.vwap || '--'}.${profileSummary}`
         );
     }
-    setText('intelBreadth', tradeState.overbought_oversold || '--');
+    const rsi = intelNumber(regime.rsi);
+    setText('intelBreadth', tradeState.overbought_oversold ||
+        (rsi !== null ? `${rsi.toFixed(1)} RSI` : '--'));
     const wtSummary = wavetrend.available
         ? ` WaveTrend ${normalizeToken(wavetrend.bias || 'neutral')} / ${normalizeToken(wavetrend.exhaustion || 'neutral')} (dashboard-only exhaustion).`
         : '';
@@ -2073,35 +2098,19 @@ function updateIntelPanel(inst, data) {
         : `ATR unavailable: ${tradeState.atr_reason || 'missing 5m candle state'}.`);
 
     const greeks = intel.greeks || {};
-    if (greeks.is_fallback) {
-        setText('greekIV', "OFFLINE");
-        setText('greekCallDelta', "--");
-        setText('greekPutDelta', "--");
-        setText('greekTheta', "--");
-        setText('greekSummary', "Options data unavailable");
-    } else {
-        const ivp = Number(greeks.volatility_percentile ?? greeks.iv_percentile ?? 50);
-        const volAvailable = greeks.volatility_percentile_available !== false;
-        
-        // India VIX percentile describes volatility regime, not option cheapness.
-        const volRegime = !volAvailable ? "VOL N/A" : (ivp < 30 ? "LOW VOL" : (ivp > 70 ? "HIGH VOL" : "MID VOL"));
-        setText('greekIV', volRegime);
-        
-        // 2. Translation: Power (Rupees per 100 points)
-        const callDelta = Number(greeks.call?.delta || 0);
-        const deltaMove = (callDelta * 100).toFixed(0);
-        setText('greekCallDelta', `+₹${deltaMove}`);
-        setText('greekPutDelta', `-₹${deltaMove}`);
-        
-        // 3. Translation: Time Cost (Rupees per Day)
-        const leak = Math.abs(greeks.call?.theta || greeks.total_theta || 0).toFixed(1);
-        setText('greekTheta', `₹${leak}/day`);
-
-        // 4. Ultra-compact interpretation
-        const vixValue = Number(greeks.volatility_value || 0);
-        const volText = volAvailable ? `VIX ${vixValue.toFixed(1)} P${ivp.toFixed(0)}` : "VIX percentile unavailable";
-        setText('greekSummary', `${volText} | ₹${deltaMove}/100pts | -₹${leak}/day`);
-    }
+    const vix = intelNumber(greeks.volatility_value);
+    const ivp = intelNumber(greeks.volatility_percentile);
+    const callDelta = greeks.is_fallback ? null : intelNumber(greeks.call?.delta);
+    const putDelta = greeks.is_fallback ? null : intelNumber(greeks.put?.delta);
+    const theta = greeks.is_fallback ? null : intelNumber(greeks.call?.theta);
+    setText('greekIV', vix > 0 ? vix.toFixed(1) : '--');
+    setText('greekCallDelta', callDelta !== null ? `+₹${Math.abs(callDelta * 100).toFixed(0)}` : '--');
+    setText('greekPutDelta', putDelta !== null ? `+₹${Math.abs(putDelta * 100).toFixed(0)}` : '--');
+    setText('greekTheta', theta !== null ? `₹${Math.abs(theta).toFixed(1)}/day` : '--');
+    const vixLabel = greeks.volatility_percentile_available === true && ivp !== null
+        ? `VIX P${ivp.toFixed(0)}` : '';
+    setText('greekSummary', [vixLabel, callDelta === null && putDelta === null
+        ? (greeks.msg || 'Option Greeks unavailable') : 'Estimated move per 100 index points'].filter(Boolean).join(' · '));
 
 }
 
@@ -2207,7 +2216,7 @@ function setupEventListeners() {
     if (upstoxBadge) {
         upstoxBadge.style.cursor = 'pointer';
         upstoxBadge.onclick = startUpstoxAuthFlow;
-        upstoxBadge.title = 'Upstox Primary Broker. Click to log in / refresh.';
+        upstoxBadge.title = 'Upstox market data. Click to log in or refresh.';
     }
 
     window.addEventListener('message', (event) => {
@@ -2607,17 +2616,12 @@ async function startFyersAuthFlow() { return startUpstoxAuthFlow(); }
 async function submitFyersCode(code) { return submitUpstoxCode(code); }
 async function completeFyersRedirectIfPresent() { return completeUpstoxRedirectIfPresent(); }
 
-function updateGatewayStatus(status) {
+function updateGatewayStatus(status, mode) {
     status = status || {};
     const upstox = status.upstox || {};
     const upstoxOnline = status.upstox_healthy === true || status.upstox_session_live === true || upstox.healthy === true;
-    const brokerStatus = status.broker_status || {};
-    const failoverActive = brokerStatus.failover_active === true;
-    const angelOnline = status.angelone === true || failoverActive;
-
     const gateways = {
         'gw_upstox': upstoxOnline,
-        'gw_angelone': angelOnline,
         'gw_kite': false,
         'gw_fyers': false,
     };
@@ -2641,21 +2645,46 @@ function updateGatewayStatus(status) {
         upstoxEl.style.cursor = 'pointer';
         upstoxEl.onclick = startUpstoxAuthFlow;
         upstoxEl.title = upstoxOnline
-            ? 'Upstox Primary Broker LIVE & Ready. Click to view/refresh.'
-            : 'Upstox Primary Broker offline / unauthenticated. Click to log in / refresh.';
+            ? 'Upstox market data connected. Click to view or refresh.'
+            : 'Upstox market data disconnected. Click to log in or refresh.';
     }
 
     const angelEl = document.getElementById('gw_angelone');
     if (angelEl) {
-        if (failoverActive) {
-            angelEl.classList.remove('standby', 'offline');
-            angelEl.classList.add('online');
-            angelEl.title = '⚠️ ANGEL ONE ACTIVE (Failover from Upstox > 30s)';
-        } else {
-            angelEl.classList.remove('online', 'offline');
-            angelEl.classList.add('standby');
-            angelEl.title = 'Angel One Backup Broker (Standby - triggers if Upstox fails > 30s)';
+        const broker = status.broker_status || {};
+        const modeName = String(mode || '').trim().toUpperCase();
+        let appearance = '';
+        let label = 'CHECKING';
+        let detail = 'Waiting for trading mode';
+        if (['HISTORICAL', 'REPLAY', 'BACKTEST', 'PAPER', 'LIVE_PAPER', 'MANUAL'].includes(modeName)) {
+            appearance = 'standby';
+            label = 'STANDBY';
+            detail = 'Angel One connects for order execution in REAL mode';
+        } else if (['REAL', 'LIVE_REAL', 'LIVE'].includes(modeName)) {
+            appearance = 'offline';
+            if (broker.provider !== 'angelone') {
+                label = 'UNAVAILABLE';
+                detail = 'Angel One execution status unavailable';
+            } else if (broker.configured === false) {
+                label = 'NOT CONFIGURED';
+                detail = 'Angel One execution credentials are incomplete';
+            } else if (broker.connected !== true) {
+                label = 'DISCONNECTED';
+                detail = 'Angel One execution session unavailable in REAL mode';
+            } else if (broker.lease_held !== true) {
+                label = 'BLOCKED';
+                detail = 'This RP94 instance does not hold the Angel One order execution lease';
+            } else {
+                appearance = 'online';
+                label = 'CONNECTED';
+                detail = 'Angel One execution session connected';
+            }
         }
+        angelEl.classList.remove('online', 'offline', 'standby');
+        if (appearance) angelEl.classList.add(appearance);
+        angelEl.title = detail;
+        const labelEl = document.getElementById('gw_angelone_state');
+        if (labelEl && labelEl.textContent !== label) labelEl.textContent = label;
     }
 }
 

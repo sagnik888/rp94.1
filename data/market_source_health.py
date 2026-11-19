@@ -253,6 +253,27 @@ def build_market_source_snapshot(
 ) -> Dict[str, Any]:
     now = time.time() if now_ts is None else float(now_ts)
     records = []
+    if getattr(provider, "upstox_only", False):
+        from data.upstox_market_data import UPSTOX_INDEX_KEYS
+
+        key = UPSTOX_INDEX_KEYS.get(symbol)
+        for cache, source, latency, max_age in (
+            (provider._ws_cache, "upstox_ws", "REALTIME", 5.0),
+            (provider._ltp_cache, "upstox_rest", "NEAR_REALTIME", 5.0),
+        ):
+            row = cache.get(key)
+            if isinstance(row, dict) and row.get("source") == source:
+                try:
+                    age = now - float(row["time"])
+                except (KeyError, ValueError, TypeError):
+                    age = float("inf")
+                records.append(_source_record(source, row, latency,
+                                              -1.0 <= age <= max_age, now))
+        records.sort(key=lambda row: (not row["entry_eligible"],
+                                      float("inf") if row["age_seconds"] is None else row["age_seconds"]))
+        return {"instrument": symbol, "sources": records, "freshest": records[0] if records else {},
+                "entry_eligible": any(row["entry_eligible"] for row in records),
+                "context_only_sources": [row for row in records if not row["entry_eligible"]]}
     ws_keys = []
     token_info = index_spot_tokens.get(symbol)
     if token_info:

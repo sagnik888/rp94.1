@@ -240,10 +240,10 @@ class IntelligenceAggregator:
                 derivatives["reason"] = str(exc)
         results["derivative_participation"] = derivatives
         if not chain_authoritative:
-            chain_quality["reason"] = (
+            chain_quality.setdefault("reason", (
                 "Option chain unavailable" if actual_strike_count == 0 else
                 "Option chain is not authoritative (fallback, stale, expiry mismatch, or insufficient strikes)"
-            )
+            ))
 
         # The requested analysis timeframe owns its volume/order-flow measurement.
         # A 1m frame may be used by explicit microstructure features elsewhere, but
@@ -305,6 +305,15 @@ class IntelligenceAggregator:
 
         # 2. OI
         if intelligence_chain is not None:
+            if (chain_quality.get("source") == "upstox" and chain_quality.get("volume_complete") is True
+                    and {"call_volume", "put_volume"}.issubset(intelligence_chain.columns)):
+                volume = intelligence_chain[["call_volume", "put_volume"]].to_numpy(dtype=float)
+                if np.isfinite(volume).all() and (volume >= 0).all():
+                    results["option_volume"] = {
+                        "available": True, "quantity": float(volume.sum()), "provider": "Upstox",
+                        "expiry": intelligence_chain.attrs.get("expiry") or chain_quality.get("active_expiry"),
+                        "observed_at": chain_quality.get("fetched_at_epoch") or chain_quality.get("recorded_at"),
+                    }
             oi_result = self.oi.analyze(intelligence_chain, price_change_pct, spot_price, strike_interval,
                 timeframe_seconds={"1min":60,"5min":300,"15min":900}.get(timeframe,300),
                 derivative_features=derivatives)
@@ -475,6 +484,14 @@ class IntelligenceAggregator:
             results["oi"] = self.oi._empty_result()
             results["pcr"] = self.pcr._empty_result()
             results["greeks"] = {}
+        try:
+            vix_value = float(volatility_value)
+        except (TypeError, ValueError):
+            vix_value = 0.0
+        if np.isfinite(vix_value) and vix_value > 0:
+            results["greeks"].setdefault("volatility_value", round(vix_value, 3))
+            results["greeks"].setdefault("volatility_percentile", volatility_percentile)
+            results["greeks"].setdefault("volatility_percentile_available", volatility_percentile is not None)
 
         # 5. Regime
         try:
@@ -520,7 +537,7 @@ class IntelligenceAggregator:
         # 6. Order Flow
         flow_result = self.order_flow.analyze(
             intel_df,
-            options_chain=intelligence_chain,
+            options_chain=intelligence_chain if chain_quality.get("volume_complete", True) else None,
             spot_price=spot_price,
             strike_interval=strike_interval,
             market_context=chain_quality,

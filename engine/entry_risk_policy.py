@@ -24,7 +24,8 @@ proven safe.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional
+from math import isfinite
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 
 def _value(item: Any, name: str, default: Any = None) -> Any:
@@ -37,9 +38,9 @@ def _value(item: Any, name: str, default: Any = None) -> Any:
 def _positive_float(value: Any) -> float:
     try:
         result = float(value or 0.0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
-    return result if result > 0.0 else 0.0
+    return result if isfinite(result) and result > 0.0 else 0.0
 
 
 def normalized_instrument_type(item: Any) -> str:
@@ -52,6 +53,7 @@ def projected_stop_risk_rs(
     *,
     entry_price: float = 0.0,
     slippage_bps: float = 0.0,
+    estimate_cost: Optional[Callable] = None,
 ) -> Optional[float]:
     """Maximum loss from entry to the ACTUAL protective stop, in rupees.
 
@@ -77,29 +79,36 @@ def projected_stop_risk_rs(
     if entry <= 0.0 or stop <= 0.0:
         return None
 
-    try:
-        lots = max(1, int(_value(item, "lots", 1) or 1))
-        lot_size = max(1, int(_value(item, "lot_size", 1) or 1))
-    except (TypeError, ValueError):
+    lots = _positive_float(_value(item, "lots"))
+    lot_size = _positive_float(_value(item, "lot_size"))
+    if not (lots and lots.is_integer() and lot_size and lot_size.is_integer()):
         return None
-    quantity = lots * lot_size
+    quantity = int(lots) * int(lot_size)
     inst_type = normalized_instrument_type(item)
 
     if inst_type == "OPT":
         adverse_distance = max(0.0, entry - stop)
         multiplier = 1.0
     else:
-        direction = str(_value(item, "direction", "LONG") or "LONG").upper()
+        direction = str(_value(item, "direction", "") or "").upper()
+        if direction not in {"LONG", "BUY", "SHORT", "SELL"}:
+            return None
         adverse_distance = (
-            max(0.0, stop - entry) if direction == "SHORT" else max(0.0, entry - stop)
+            max(0.0, stop - entry) if direction in {"SHORT", "SELL"} else max(0.0, entry - stop)
         )
-        multiplier = _positive_float(_value(item, "multiplier", 1.0)) or 1.0
+        multiplier = _positive_float(_value(item, "instrument_multiplier",
+                                           _value(item, "multiplier", 1.0)))
+        if not multiplier:
+            return None
 
     price_risk = adverse_distance * quantity * multiplier
-    slip = (
-        entry * quantity * multiplier * max(0.0, float(slippage_bps or 0.0)) / 10_000.0
-    )
-    return max(0.0, price_risk + slip)
+    if estimate_cost is not None:
+        cost = float(estimate_cost(item, entry, stop, quantity, inst_type, multiplier))
+    else:
+        bps = float(slippage_bps or 0.0)
+        cost = entry * quantity * multiplier * bps / 10_000.0
+    total = price_risk + cost
+    return total if isfinite(total) and isfinite(cost) and cost >= 0 else None
 
 
 @dataclass(frozen=True)
@@ -126,6 +135,7 @@ def evaluate_entry_risk(
     slippage_bps: float = 0.0,
     entry_price: float = 0.0,
     realized_loss_by_segment: Optional[Mapping[str, float]] = None,
+    estimate_cost: Optional[Callable] = None,
 ) -> EntryRiskDecision:
     """Fail-closed prospective stop-risk decision for one new entry.
 
@@ -135,22 +145,23 @@ def evaluate_entry_risk(
     """
     candidate_type = normalized_instrument_type(candidate)
     segment_limits = {
-        "FUT": max(0.0, float(fut_limit_rs or 0.0)),
-        "OPT": max(0.0, float(opt_limit_rs or 0.0)),
+        "FUT": _positive_float(fut_limit_rs),
+        "OPT": _positive_float(opt_limit_rs),
     }
-    global_limit = max(0.0, float(global_limit_rs or 0.0))
+    global_limit = _positive_float(global_limit_rs)
     realized = {
-        "FUT": max(0.0, float((realized_loss_by_segment or {}).get("FUT", 0.0) or 0.0)),
-        "OPT": max(0.0, float((realized_loss_by_segment or {}).get("OPT", 0.0) or 0.0)),
+        segment: float((realized_loss_by_segment or {}).get(segment, 0.0) or 0.0)
+        for segment in ("FUT", "OPT")
     }
 
     risk = projected_stop_risk_rs(
-        candidate, entry_price=entry_price, slippage_bps=slippage_bps
+        candidate, entry_price=entry_price, slippage_bps=slippage_bps, estimate_cost=estimate_cost
     )
     current = {"FUT": realized["FUT"], "OPT": realized["OPT"]}
     invalid_positions = 0
     for position in positions or []:
-        position_risk = projected_stop_risk_rs(position, slippage_bps=slippage_bps)
+        position_risk = projected_stop_risk_rs(position, slippage_bps=slippage_bps,
+                                               estimate_cost=estimate_cost)
         if position_risk is None:
             invalid_positions += 1
             continue
@@ -176,6 +187,8 @@ def evaluate_entry_risk(
             global_limit_rs=global_limit,
         )
 
+    if any(not isfinite(loss) or loss < 0 for loss in realized.values()):
+        return decision(False, "realized loss unavailable")
     if risk is None:
         return decision(False, "candidate stop risk unavailable")
     if invalid_positions:
@@ -185,6 +198,8 @@ def evaluate_entry_risk(
             False, f"{invalid_positions} open position risk value(s) unavailable"
         )
     absolute_cap = max(0.0, float(max_trade_loss_abs or 0.0))
+    if not isfinite(float(max_trade_loss_abs or 0.0)):
+        return decision(False, "per-trade risk limit unavailable")
     if absolute_cap > 0.0 and candidate_risk > absolute_cap:
         return decision(
             False,

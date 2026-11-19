@@ -194,6 +194,18 @@ async def _call_on_scanner_loop(
     return await _await_on_scanner_loop(_invoke(), timeout_seconds=timeout_seconds)
 
 
+async def _configure_on_scanner_loop(**changes):
+    scanner = scanner_ref
+
+    async def apply():
+        configure = getattr(scanner, "configure_async", None)
+        if callable(configure):
+            return await configure(**changes)
+        return scanner.configure(**changes)
+
+    return await _await_on_scanner_loop(apply(), timeout_seconds=45.0)
+
+
 def _start_on_scanner_loop(func: Callable[[], Any]) -> asyncio.Future:
     """Start one synchronous scanner call on the scanner-owned loop; return its future.
 
@@ -1641,7 +1653,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
 
     elif cmd == "configure":
         if scanner_ref:
-            configured = await _call_on_scanner_loop(lambda: scanner_ref.configure(
+            configured = await _configure_on_scanner_loop(
                 capital_total=msg.get("capital_total"),
                 entry_preopen_signal_guard_enabled=msg.get("entry_preopen_signal_guard_enabled"),
                 entry_mark_touch_validation_enabled=msg.get("entry_mark_touch_validation_enabled"),
@@ -1963,7 +1975,7 @@ async def handle_command(ws: WebSocket, msg: Dict):
                 pullback_hedge_resume_recovery_pct=msg.get("pullback_hedge_resume_recovery_pct"),
                 pullback_hedge_size_fraction=msg.get("pullback_hedge_size_fraction"),
                 pullback_hedge_max_hold_minutes=msg.get("pullback_hedge_max_hold_minutes"),
-            ))
+            )
             await _send_command_response(
                 ws,
                 msg,
@@ -1975,12 +1987,12 @@ async def handle_command(ws: WebSocket, msg: Dict):
         if scanner_ref:
             mode = msg.get("mode", "paper")
             reset = msg.get("reset", False)
-            configured = await _call_on_scanner_loop(lambda: scanner_ref.configure(
+            configured = await _configure_on_scanner_loop(
                 mode=mode,
                 reset=reset,
                 confirm_real_mode=msg.get("confirm_real_mode", False),
                 real_mode_verification=msg.get("real_mode_verification", ""),
-            ))
+            )
             await _send_command_response(
                 ws,
                 msg,
@@ -3563,40 +3575,24 @@ async def api_upstox_status(request: Request):
 
 @app.get("/api/broker_status")
 async def api_broker_status(request: Request):
-    """Return failover state (Upstox primary, Angel One fallback)."""
+    """Show independent market-data and execution readiness."""
     if not (_request_authorized(request) or _is_loopback_client(request)):
         return {"status": "error", "message": "Unauthorized"}
-    failover_status = {}
-    if scanner_ref and hasattr(scanner_ref, "trades") and hasattr(scanner_ref.trades, "real_broker"):
-        broker = scanner_ref.trades.real_broker
-        if hasattr(broker, "get_failover_status"):
-            failover_status = broker.get_failover_status()
+    broker = getattr(getattr(scanner_ref, "trades", None), "real_broker", None)
+    reader = getattr(broker, "execution_status", None)
     from data.upstox_auth import get_upstox_auth_status
     return {
         "status": "ok",
-        "failover": failover_status,
+        "market_data_provider": "upstox",
+        "execution": reader() if callable(reader) else {"provider": "angelone", "connected": False},
         "upstox_auth": get_upstox_auth_status(),
     }
 
 
 @app.post("/api/upstox_postback")
 async def api_upstox_postback(request: Request):
-    """Receive Upstox webhook order postback and relay to TradeManager."""
-    try:
-        payload = await request.json()
-    except Exception:
-        return {"status": "error", "message": "malformed payload"}
-    if not isinstance(payload, dict):
-        return {"status": "error", "message": "malformed payload"}
-    logger.info(f"Upstox postback received: {payload}")
-    try:
-        if scanner_ref is not None:
-            handler = getattr(getattr(scanner_ref, "trades", None), "on_broker_postback", None)
-            if callable(handler):
-                handler(dict(payload))
-    except Exception as exc:
-        logger.exception(f"Upstox postback handling failed: {exc}")
-    return {"status": "ok"}
+    """Upstox is the market-data source in this runtime."""
+    return {"status": "ignored", "reason": "Upstox order updates are disabled"}
 
 
 @app.get("/api/fyers_auth")
@@ -3633,6 +3629,8 @@ def _is_loopback_client(request: Request) -> bool:
 @app.get("/api/kite_auth_url")
 async def api_kite_auth_url(request: Request):
     """Authenticated: hand the dashboard the Kite login URL to open."""
+    if getattr(getattr(scanner_ref, "data", None), "upstox_only", False):
+        return {"status": "disabled", "message": "Market data uses Upstox"}
     if not _request_authorized(request):
         return {"status": "error", "message": "Unauthorized"}
     from data.kite_auth import get_kite_auth
@@ -3654,6 +3652,8 @@ async def api_kite_login(request: Request):
     Kite has no password-based API login, so no account password is accepted, stored,
     or transmitted anywhere in this flow.
     """
+    if getattr(getattr(scanner_ref, "data", None), "upstox_only", False):
+        return HTMLResponse("Kite login is disabled. Market data uses Upstox.", status_code=410)
     if not _is_loopback_client(request):
         return HTMLResponse("Unauthorized", status_code=401)
     from data.kite_auth import get_kite_auth
@@ -3727,6 +3727,8 @@ async def api_kite_postback(request: Request):
     ignored, because this endpoint must be reachable by Zerodha and therefore cannot
     sit behind the dashboard's header token.
     """
+    if getattr(getattr(scanner_ref, "data", None), "upstox_only", False):
+        return {"status": "ignored", "reason": "Angel One owns order execution"}
     import hashlib
 
     from fastapi.responses import JSONResponse

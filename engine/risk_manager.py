@@ -38,6 +38,7 @@ class RiskManager:
         self.daily_loss_breached = False
         self.fut_loss_breached = False
         self.opt_loss_breached = False
+        self._risk_snapshot_unavailable = False
         self._session_date = datetime.now(IST).date()
         self._risk_lock = threading.RLock()
         
@@ -282,7 +283,7 @@ class RiskManager:
                 opt_projected_pnl += charge
 
         # Take one immutable view for this complete risk pass.  Reconciliation
-        # can move a Trade from open -> closed and replace orphan state at the
+        # can move a Trade from open -> closed at the
         # same time; snapshots taken in separate critical sections can count it
         # twice or miss it entirely.
         manager_lock = getattr(self.trades, "_lock", None)
@@ -291,23 +292,15 @@ class RiskManager:
                 with manager_lock:
                     closed_snapshot = [copy.copy(t) for t in self.trades.closed_trades]
                     open_snapshot = [copy.copy(t) for t in self.trades.open_trades.values()]
-                    orphan_snapshot = copy.deepcopy(
-                        getattr(self.trades, "orphan_positions", {}) or {}
-                    )
             else:
                 closed_snapshot = [copy.copy(t) for t in self.trades.closed_trades]
                 open_snapshot = [copy.copy(t) for t in self.trades.open_trades.values()]
-                orphan_snapshot = copy.deepcopy(
-                    getattr(self.trades, "orphan_positions", {}) or {}
-                )
         except Exception as exc:
-            logger.critical(f"Risk snapshot failed; halting both segments: {exc}")
-            closed_snapshot = []
-            open_snapshot = []
-            orphan_snapshot = {
-                "RISK_SNAPSHOT_UNKNOWN_FUT": {"instrumenttype": "FUT"},
-                "RISK_SNAPSHOT_UNKNOWN_CE": {"instrumenttype": "OPT"},
-            }
+            if not getattr(self, "_risk_snapshot_unavailable", False):
+                logger.critical(f"Risk snapshot failed. New entries blocked: {exc}")
+            self._risk_snapshot_unavailable = True
+            return True
+        self._risk_snapshot_unavailable = False
 
         # 1. Closed Trades for today (Cached)
         current_count = len(closed_snapshot)
@@ -400,26 +393,8 @@ class RiskManager:
             except Exception as exc:
                 _charge_fail_closed(getattr(t, "inst_type", "OPT"), f"open trade: {exc}")
 
-        # Broker-only, excess, and ambiguous positions are real exposure even
-        # though they are not represented by a managed Trade.  Their valuation
-        # cannot be trusted here, so consume the full relevant segment budget.
-        # This prevents a reconciliation failure from becoming invisible risk.
-        for symbol, position in orphan_snapshot.items():
-            text = str(symbol or "").upper()
-            position_type = (
-                str((position or {}).get("instrumenttype") or "").upper()
-                if isinstance(position, dict)
-                else ""
-            )
-            inst_type = (
-                "OPT"
-                if position_type in {"OPT", "OPTCUR", "OPTIDX", "OPTSTK"}
-                or text.endswith("CE")
-                or text.endswith("PE")
-                else "FUT"
-            )
-            _charge_fail_closed(inst_type, f"unreconciled broker position {symbol}")
-        
+        # Unreconciled exposure blocks entry through entry_block_reason().
+        # Circuit breakers use the managed book's P&L and projected stop risk.
         # Calculate limits in absolute terms
         fut_limit = -(self.capital_fut * (self.risk_fut_pct / 100.0))
         opt_limit = -(self.capital_opt * (self.risk_opt_pct / 100.0))
@@ -496,14 +471,24 @@ class RiskManager:
             if t.inst_type == segment:
                 self.trades.close_trade(tid, t.current_price, reason)
 
-    @_risk_serialized
     def can_trade(self, inst_type: str) -> bool:
         """Check if trading is allowed for a segment"""
+        return not self.entry_block_reason(inst_type)
+
+    @_risk_serialized
+    def entry_block_reason(self, inst_type: str) -> str:
         self.reset_for_session(datetime.now(IST).date())
-        if self.daily_loss_breached: return False
-        if inst_type == "FUT" and self.fut_loss_breached: return False
-        if inst_type == "OPT" and self.opt_loss_breached: return False
-        return True
+        if not getattr(self.trades, "_trade_state_loaded", True):
+            return "Trade ledger restore failed"
+        if getattr(self, "_risk_snapshot_unavailable", False):
+            return "Risk position snapshot unavailable"
+        if getattr(self.trades, "orphan_positions", None):
+            return "Broker-only orphan position requires reconciliation"
+        if (self.daily_loss_breached or
+                inst_type == "FUT" and self.fut_loss_breached or
+                inst_type == "OPT" and self.opt_loss_breached):
+            return f"Risk circuit breaker latched for {inst_type}"
+        return ""
 
     @_risk_serialized
     def reset_for_session(self, session_date) -> bool:

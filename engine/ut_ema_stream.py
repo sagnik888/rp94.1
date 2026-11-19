@@ -41,6 +41,9 @@ class UTEmaTickService:
         self._journal_position = {}
         self._overflowed = set()
         self._missing_path = {}
+        self._watched_owners = set()
+        self._next_owner_check = 0.0
+        self._next_history_check = {}
         self.health = {}
         scanner._utema_stream_health = self.health
         scanner.mtf._utema_stream_service_installed = True
@@ -48,13 +51,42 @@ class UTEmaTickService:
             if getattr(adapter, "signal_source", "") == ENGINE_KEY:
                 adapter._utema_stream_owned = True
 
-    def _adapter(self, instrument, timeframe):
+    def _adapter(self, instrument, timeframe, *, include_unwatched=False):
         mtf = self.scanner.mtf
         key = f"{instrument}_{timeframe}"
         adapter = (getattr(mtf, "engines", {}) or {}).get(key)
-        if getattr(adapter, "signal_source", "") != ENGINE_KEY:
+        if (getattr(adapter, "signal_source", "") != ENGINE_KEY and
+                (include_unwatched or key in self._watched_owners)):
             adapter = (getattr(mtf, "_retired_utema_engines", {}) or {}).get(key)
         return adapter if getattr(adapter, "signal_source", "") == ENGINE_KEY else None
+
+    def monitor_owner(self, trade, lifecycle_id, entry_time):
+        """Register a held owner and read its latest protection without blocking."""
+        instrument, timeframe = trade.instrument, trade.timeframe
+        if timeframe not in ("5min", "15min"):
+            return None
+        key = f"{instrument}_{timeframe}"
+        adapter = self._adapter(instrument, timeframe, include_unwatched=True)
+        if adapter is None:
+            from engine.alt_scanners import UTEmaSignalEngine
+
+            adapter = UTEmaSignalEngine()
+            adapter._utema_stream_owned = True
+            adapter = self.scanner.mtf._retired_utema_engines.setdefault(key, adapter)
+        self._watched_owners.add(key)
+        return adapter.monitor_snapshot(lifecycle_id, entry_time, wait=False)
+
+    def _prune_closed_owners(self):
+        from engine.ut_ema_lane import active_rows
+
+        now = time.monotonic()
+        if now < self._next_owner_check:
+            return
+        self._next_owner_check = now + 1.0
+        for key in self._watched_owners.copy():
+            instrument, timeframe = key.rsplit("_", 1)
+            if not active_rows(self.scanner, instrument, timeframe):
+                self._watched_owners.discard(key)
 
     def _status(self, key, status, detail="", **extra):
         if key in self._overflowed:
@@ -156,6 +188,7 @@ class UTEmaTickService:
                 self._flush_checkpoints()
                 return
             try:
+                self._prune_closed_owners()
                 self.process_observation(*observation, drain_on_shutdown=True)
             except Exception as exc:
                 logger.error(f"UT/EMA tick worker: {type(exc).__name__}: {exc}")
@@ -289,10 +322,10 @@ class UTEmaTickService:
         return core.observe_tick(price, stamp)
 
     def _session_bounds(self, stamp):
+        from data.market_calendar import index_session_bounds
+
         bounds = getattr(self.scanner.data, "get_index_session_bounds", None)
-        opening, closing = (bounds(stamp.to_pydatetime()) if callable(bounds) else (
-            stamp.normalize()+pd.Timedelta(hours=9, minutes=15),
-            stamp.normalize()+pd.Timedelta(hours=15, minutes=30)))
+        opening, closing = (bounds if callable(bounds) else index_session_bounds)(stamp.to_pydatetime())
         return market_stamp(opening), market_stamp(closing)
 
     def _history_gap(self, frame, timeframe, clock, *, start=None):
@@ -305,28 +338,23 @@ class UTEmaTickService:
         lower = min(market_stamp(start), history.index[0]) if start is not None else history.index[0]
         holidays, specials = set(load_nse_holidays()), set(load_nse_special_trading_days())
         period = pd.Timedelta(minutes=minutes(timeframe))
-        sessions = {}
-        for stamp in history.index[history.index <= clock]:
-            day = stamp.normalize()
-            label = day.date().isoformat()
-            if label not in specials and (day.weekday() >= 5 or label in holidays):
-                return f"Index candle outside an exchange session: {stamp.isoformat()}"
-            if day not in sessions:
-                sessions[day] = self._session_bounds(stamp)
-            opening, closing = sessions[day]
-            if not opening <= stamp < closing or (stamp-opening) % period != pd.Timedelta(0):
-                return f"Index candle outside its timeframe grid: {stamp.isoformat()}"
-        available = set(history.index)
+        stamps = history.index[history.index <= clock]
         for day in pd.date_range(lower.normalize(), clock.normalize(), freq="D"):
             label = day.date().isoformat()
+            day_stamps = stamps[stamps.slice_indexer(day, day + pd.Timedelta(days=1, nanoseconds=-1))]
             if label not in specials and (day.weekday() >= 5 or label in holidays):
+                if len(day_stamps):
+                    return f"Index candle outside an exchange session: {day_stamps[0].isoformat()}"
                 continue
-            opening, closing = sessions.get(day) or self._session_bounds(day)
-            for bar in pd.date_range(opening, closing, freq=f"{minutes(timeframe)}min", inclusive="left"):
-                if bar < lower or min(bar+period, closing) > clock:
-                    continue
-                if bar not in available:
-                    return f"Closed index candle missing: {bar.isoformat()}"
+            opening, closing = self._session_bounds(day)
+            grid = pd.date_range(opening, closing, freq=period, inclusive="left")
+            off_grid = day_stamps.difference(grid)
+            if len(off_grid):
+                return f"Index candle outside its timeframe grid: {off_grid[0].isoformat()}"
+            closed = grid[(grid >= lower) & ((grid + period <= clock) | (closing <= clock))]
+            missing = closed.difference(day_stamps)
+            if len(missing):
+                return f"Closed index candle missing: {missing[0].isoformat()}"
         return ""
 
     def _session_history(self, frame):
@@ -366,31 +394,50 @@ class UTEmaTickService:
     def _bootstrap_history(self, instrument, timeframe, frame, clock):
         """Fill absent closed bars only from complete official one-minute candles."""
         from engine.ut_ema_engine import UTEmaEngine, minutes
+        from data.market_calendar import INDEX_SPECIAL_SESSION_HOURS
+
         history = self._session_history(frame)
         if history is None or history.empty:
             return history
-        gap = self._history_gap(history, timeframe, clock)
-        if not gap.startswith("Closed index candle missing:"):
+        upstox = getattr(self.scanner.data, "upstox_only", False) is True
+        if not upstox and not self._history_gap(history, timeframe, clock).startswith("Closed index candle missing:"):
             return history
         base = self.scanner.candles.get_candles(instrument, "1min")
+        start = market_stamp(frame.index[0])
+        if upstox:
+            # Tick-built higher candles can hide missing minutes. Recover the current
+            # session and the special-session grid from closed Upstox candles only.
+            today = clock.date().isoformat()
+            rebuild_days = {today, *INDEX_SPECIAL_SESSION_HOURS}
+            history = history.loc[history.index.strftime("%Y-%m-%d") != today]
+            for special_day in INDEX_SPECIAL_SESSION_HOURS:
+                opening, closing = self._session_bounds(market_stamp(special_day))
+                grid = pd.date_range(opening, closing, freq=f"{minutes(timeframe)}min", inclusive="left")
+                labels = history.index.strftime("%Y-%m-%d")
+                history = history.loc[(labels != special_day) | history.index.isin(grid)]
+            if base is not None and "price_source" in base:
+                base = base.loc[base["price_source"].eq("upstox_history") &
+                                base.index.strftime("%Y-%m-%d").isin(rebuild_days)]
+            else:
+                base = None
         if base is None or base.empty:
             return history
         base = UTEmaEngine.prepare(self._session_history(base))
+        base = base.loc[base.index == base.index.floor("min")]
+        if upstox and start.date().isoformat() in INDEX_SPECIAL_SESSION_HOURS:
+            start = self._session_bounds(start)[0]
         period = pd.Timedelta(minutes=minutes(timeframe))
         recovered = []
         for day in base.index.normalize().unique():
             opening, closing = self._session_bounds(day)
             rows = base.loc[(base.index >= opening) & (base.index < closing)]
-            for bar, group in rows.resample(f"{minutes(timeframe)}min", origin=opening):
-                end = min(bar+period, closing)
-                if bar in history.index or end > clock or bar < history.index[0]:
-                    continue
-                expected = pd.date_range(bar, end, freq="min", inclusive="left")
-                if not group.index.equals(expected):
-                    continue
-                recovered.append(pd.DataFrame({"open": [group.open.iloc[0]],
-                    "high": [group.high.max()], "low": [group.low.min()],
-                    "close": [group.close.iloc[-1]]}, index=pd.DatetimeIndex([bar])))
+            batches = rows.resample(period, origin=opening)
+            aggregate = batches.agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            end = (aggregate.index + period).where(aggregate.index + period <= closing, closing)
+            expected_count = (end - aggregate.index) // pd.Timedelta(minutes=1)
+            complete = batches.size().eq(expected_count) & (end <= clock) & (aggregate.index >= start)
+            missing = ~aggregate.index.isin(history.index)
+            recovered.append(aggregate.loc[complete & missing])
         return pd.concat([history, *recovered]).sort_index() if recovered else history
 
     def _journal(self, key, price, stamp):
@@ -435,6 +482,13 @@ class UTEmaTickService:
         self._rebuilt_path(key, fresh, clock)
         return True
 
+    def _history_check_due(self, key):
+        now = time.monotonic()
+        if now < self._next_history_check.get(key, 0.0):
+            return False
+        self._next_history_check[key] = now + 1.0
+        return True
+
     def process_observation(self, instrument, price, stamp, sequence=0, *, drain_on_shutdown=False):
         """Synchronous seam for ordered-worker tests; never execute broker mutations."""
         if (self._closed and not drain_on_shutdown) or str(getattr(self.scanner, "mode", "")).upper() != "REAL":
@@ -475,6 +529,8 @@ class UTEmaTickService:
                     if (self.health.get(key, {}).get("status") == "ERROR" or
                             (self._missing_path.get(key, {}).get("requires_rebuild") and
                              getattr(core, "_timeline", None) is not None)):
+                        if drain_on_shutdown and not self._history_check_due(key):
+                            continue
                         frame = self.scanner.candles.get_candles(instrument, timeframe)
                         if not self.recover_verified_history(instrument, timeframe, frame, stamp):
                             continue
@@ -482,25 +538,25 @@ class UTEmaTickService:
                     previous = getattr(adapter, "_stream_result", {}) or {}
                     old_count = len(previous.get("utema_events", []))
                     if getattr(core, "_timeline", None) is None:
-                        frame = self.scanner.candles.get_candles(instrument, timeframe)
-                        frame = self._bootstrap_history(instrument, timeframe, frame, stamp)
-                        if frame is None or len(frame) < 2:
-                            backlog = self._pending_history.setdefault(key, [])
-                            if len(backlog) >= self.capacity:
-                                self._overflowed.add(key)
-                                self._mark_missing_path(key, "bootstrap_overflow", stamp)
-                                self._status(key, "OVERFLOW", "Native history bootstrap queue exceeded capacity")
-                            else:
-                                backlog.append((price, stamp))
-                                self._status(key, "WAITING_HISTORY", "Closed candles required for native indicator bootstrap")
+                        backlog = self._pending_history.setdefault(key, [])
+                        if len(backlog) >= self.capacity:
+                            self._overflowed.add(key)
+                            self._mark_missing_path(key, "bootstrap_overflow", stamp)
+                            self._status(key, "OVERFLOW", "Native history bootstrap queue exceeded capacity")
                             continue
-                        backlog = self._pending_history.pop(key, []) + [(price, stamp)]
-                        first_price, first_stamp = backlog[0]
+                        backlog.append((price, stamp))
+                        if drain_on_shutdown and not self._history_check_due(key):
+                            continue
+                        frame = self.scanner.candles.get_candles(instrument, timeframe)
+                        first_stamp = backlog[0][1]
+                        frame = self._bootstrap_history(instrument, timeframe, frame, first_stamp)
+                        if frame is None or len(frame) < 2:
+                            self._status(key, "WAITING_HISTORY", "Closed candles required for native indicator bootstrap")
+                            continue
                         seed = getattr(core, "seed_stream", None)
                         if callable(seed):
                             gap = self._history_gap(frame, timeframe, first_stamp)
                             if gap:
-                                self._pending_history[key] = backlog
                                 self._status(key, "WAITING_HISTORY", gap)
                                 continue
                             opening, closing = self._session_bounds(first_stamp)
@@ -512,6 +568,7 @@ class UTEmaTickService:
                             core.process(frame, instrument, timeframe, as_of=first_stamp, realtime=True)
                         # Seed indicator history; historical pending instructions do
                         # not become executable observations by loading the frame.
+                        self._pending_history.pop(key, None)
                         result = None
                         for observed_price, observed_stamp in backlog:
                             self._journal(key, observed_price, observed_stamp)
@@ -641,7 +698,7 @@ class UTEmaTickService:
     def _flush_checkpoints(self):
         for key, stamp in list(self._last_observed.items()):
             instrument, timeframe = key.rsplit("_", 1)
-            adapter = self._adapter(instrument, timeframe)
+            adapter = self._adapter(instrument, timeframe, include_unwatched=True)
             if adapter is not None:
                 with adapter._utema_lock:
                     self._save(key, adapter._native, stamp, force=True)

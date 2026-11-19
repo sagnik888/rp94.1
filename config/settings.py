@@ -98,13 +98,13 @@ class Settings(BaseSettings):
     """Main application settings loaded from .env"""
 
     # ─── Upstox API v2 (Primary Broker) ──────────────────────
-    upstox_user_id: str = "7JATYL"
-    upstox_password: str = "173089"
+    upstox_user_id: str = ""
+    upstox_password: str = ""
     upstox_api_name: str = "ut1"
-    upstox_api_key: str = "65a99933-034f-4d67-8061-aaec628a07ea"
-    upstox_api_secret: str = "a8311dytif"
+    upstox_api_key: str = ""
+    upstox_api_secret: str = ""
     upstox_redirect_uri: str = "http://127.0.0.1:8500/api/upstox/callback"
-    upstox_public_ip: str = "122.176.31.168"
+    upstox_public_ip: str = ""
     upstox_token_file: str = "upstox_token.json"
     upstox_http_timeout_seconds: float = 7.0
     upstox_failover_threshold_seconds: float = 30.0
@@ -203,7 +203,7 @@ class Settings(BaseSettings):
     # Kite owns execution. Angel One supplements it; FYERS remains a capability
     # backup, including constituent volume until replacement parity is proven.
     # The earlier two-provider candidate and legacy route remain selectable.
-    supplementary_market_data: Literal["upstox", "upstox_angel", "fyers", "kite_angel", "angel_fyers"] = "upstox_angel"
+    supplementary_market_data: Literal["upstox", "upstox_angel", "fyers", "kite_angel", "angel_fyers"] = "upstox"
     replacement_chain_strikes_each_side: int = 30
     constituent_membership_file: str = "data_store/index_constituents.json"
     constituent_history_refresh_seconds: float = 60.0
@@ -803,6 +803,7 @@ class Settings(BaseSettings):
         "PRIMARY_1",
         "INCLUDE_1MIN_15MIN",
     ] = "INCLUDE_5MIN"
+    strict_entry_timeframes: bool = False
     ut_5min_option_min_confidence: float = 0.60
     ut_5min_loss_cooldown_minutes: int = 45
     # Enforces the line above. Until 2026-08-10 that value was read by nothing but two
@@ -3147,7 +3148,8 @@ class Settings(BaseSettings):
     # Off by default because at one or two concurrent positions it duplicates the breaker.
     # It earns its keep once several lots run across several indices with cascade scaling
     # on — which is exactly when the breaker's after-the-fact halt arrives too late.
-    entry_risk_budget_enabled: bool = False
+    entry_risk_budget_enabled: bool = False  # Optional for simulation. Required for live broker exposure.
+    historical_quad_source_attribution: bool = False
     # Hold a MARGINAL profit-taking option exit for a few seconds while the quoted spread
     # is wider than the edge being captured — on an index option, exiting at the bid
     # routinely converts a small win into a small loss.
@@ -3847,6 +3849,10 @@ class Settings(BaseSettings):
 
         for key, val in data.items():
             if key in _INERT:
+                continue
+            # OAuth registration belongs to deployment configuration. A cached
+            # settings object must not overwrite a credential rotation.
+            if key in {"upstox_api_key", "upstox_api_secret", "upstox_redirect_uri", "upstox_user_id"}:
                 continue
             env_key = key.upper()
             # Auto execution authority is deliberately process-local.  Persisting

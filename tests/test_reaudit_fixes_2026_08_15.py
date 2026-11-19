@@ -493,8 +493,6 @@ def test_a_broker_built_at_runtime_is_given_its_execution_authority(
     monkeypatch, restore_trading_mode
 ):
     """Without it every order is refused: a REAL mode that cannot trade."""
-    import scanner as scanner_mod
-
     settings = restore_trading_mode
     settings.trading_mode = "HISTORICAL"
     # The authority is wired at construction, before the lease gates. Refusing at the
@@ -502,19 +500,17 @@ def test_a_broker_built_at_runtime_is_given_its_execution_authority(
     # method, without weakening what this asserts.
     built = _StubRealBroker(established=False)
 
-    import data.kite_auth as kite_auth_mod
-    import trading.kite_broker as kite_broker_mod
+    import trading.angelone_broker as execution_mod
 
-    monkeypatch.setattr(
-        kite_auth_mod, "get_kite_auth", lambda *a, **k: type("_A", (), {"kite": object()})()
-    )
-    monkeypatch.setattr(kite_broker_mod, "KiteBroker", lambda **k: built)
+    monkeypatch.setattr(execution_mod, "AngelOneBroker", lambda **k: built)
 
     trades = _StubTrades(real_broker=None)
     eng = _engine(trades, monkeypatch)
+    eng.data.upstox_only = True
 
     eng.configure(mode="REAL", real_mode_verification="YES", persist_settings=False)
 
+    assert eng.data.execution_broker is trades.real_broker is built
     assert built.authority is not None, (
         "the runtime-built broker holds an account lease but no execution authority, so "
         "_authorize_mutation refuses every order it is ever asked to send"
@@ -528,6 +524,68 @@ def test_a_broker_built_at_runtime_is_given_its_execution_authority(
     assert built.authority() is False, (
         "the authority must be read at send time, so a switch back to HISTORICAL is seen"
     )
+
+
+def test_real_switch_blocks_unready_angel_one_execution(monkeypatch, restore_trading_mode):
+    import scanner as scanner_mod
+    import trading.angelone_broker as execution_mod
+
+    built = _StubRealBroker()
+    monkeypatch.setattr(execution_mod, "AngelOneBroker", lambda **kwargs: built)
+    trades = _StubTrades()
+    eng = _engine(trades, monkeypatch)
+    eng.data.upstox_only = True
+    monkeypatch.setattr(restore_trading_mode, "production_safe_mode_required", True)
+
+    def unavailable(settings, provider, **kwargs):
+        assert provider.execution_broker is built
+        assert trades.broker is trades.mock_broker
+        return {"ok": False, "blockers": ["Angel One execution unavailable"], "warnings": []}
+
+    monkeypatch.setattr(scanner_mod, "validate_real_mode_readiness", unavailable)
+    assert eng.configure(mode="REAL", real_mode_verification="YES", persist_settings=False) is False
+    assert eng.mode == "HISTORICAL"
+    assert trades.broker is trades.mock_broker
+
+
+def test_dashboard_real_readiness_does_not_block_scanner_loop(monkeypatch, restore_trading_mode):
+    import asyncio
+    from threading import Event
+
+    import scanner as scanner_mod
+    from dashboard import server
+
+    broker = _StubRealBroker()
+    trades = _StubTrades(broker)
+    eng = _engine(trades, monkeypatch)
+    eng.mode = "PAPER"
+    monkeypatch.setattr(restore_trading_mode, "production_safe_mode_required", True)
+    monkeypatch.setattr(server, "scanner_ref", eng)
+    started, release = Event(), Event()
+
+    def blocked_readiness(*args, **kwargs):
+        started.set()
+        assert release.wait(2.0), "readiness blocked the scanner loop"
+        return {"ok": False, "blockers": ["execution readiness unavailable"], "warnings": []}
+
+    monkeypatch.setattr(scanner_mod, "validate_real_mode_readiness", blocked_readiness)
+
+    async def run():
+        eng._event_loop = asyncio.get_running_loop()
+        request = asyncio.create_task(server._configure_on_scanner_loop(
+            mode="REAL", real_mode_verification="YES", persist_settings=False,
+        ))
+        try:
+            assert await asyncio.to_thread(started.wait, 1.0)
+            assert not request.done()
+            assert eng.mode == "PAPER"
+            assert trades.broker is trades.mock_broker
+        finally:
+            release.set()
+        assert await request is False
+        assert eng.mode == "PAPER"
+
+    asyncio.run(run())
 
 
 # ── P0-E: the ledger sized an exit larger than the account holds ────────────
@@ -680,15 +738,26 @@ def test_a_full_add_is_unchanged():
 # even with a token the "fetch" returned a stale frame and wrote nothing. On disk: 139
 # archived option files, newest 2026-07-31, and zero in any August session.
 
-def test_the_provider_really_does_not_expose_the_probed_token_apis():
-    """The premise. If this ever changes, the event-token path is merely redundant."""
-    from data.market_data import MarketDataProvider
+def test_missing_archive_token_resolves_only_exact_upstox_symbol(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
 
-    probed = ("get_token_for_symbol", "resolve_token", "symbol_token", "contract_master")
-    assert not any(hasattr(MarketDataProvider, name) for name in probed), (
-        "main._contract_token_for would now work; re-check whether the event-token "
-        "path is still the right source"
-    )
+    import pandas as pd
+
+    from data.market_data import MarketDataProvider
+    from engine.expiry_manager import expiry_manager
+    from main import _contract_token_for
+
+    symbol = "NIFTY 25200 CE 23 NOV 26"
+    monkeypatch.setattr(expiry_manager, "df", pd.DataFrame(
+        [{"symbol": symbol, "token": "NSE_FO|12345"}]
+    ))
+    provider = MarketDataProvider.__new__(MarketDataProvider)
+    provider.upstox_only = True
+    provider.kite = SimpleNamespace(instrument_token=Mock(side_effect=AssertionError("Kite lookup")))
+    assert _contract_token_for(provider, symbol) == "NSE_FO|12345"
+    assert _contract_token_for(provider, "NIFTY 25300 CE 23 NOV 26") == ""
+    provider.kite.instrument_token.assert_not_called()
 
 
 def test_the_session_events_supply_the_contract_token():

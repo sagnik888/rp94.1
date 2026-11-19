@@ -1,8 +1,8 @@
 """Upstox API v2 session authentication and lifecycle management.
 
 Handles OAuth2 code exchange, JWT token persistence, daily 03:30 IST
-expiry lifecycle, live session probes against /v2/user/profile,
-candidate redirect URI resolution, and CLI daily login helpers.
+expiry lifecycle, live session probes against /v2/user/profile, and CLI daily
+login helpers.
 Modeled after MANTRA v5.12 battle-tested Upstox engine.
 """
 from __future__ import annotations
@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
+from dotenv import dotenv_values
 from loguru import logger
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,12 +68,9 @@ def read_upstox_env() -> Dict[str, str]:
     env_file = ROOT / ".env"
     if env_file.exists():
         try:
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    env[key.strip()] = value.strip().strip('"').strip("'")
-        except Exception:
+            env.update({key.upper(): (value or "").strip() for key, value in
+                        dotenv_values(env_file, encoding="utf-8-sig", interpolate=False).items()})
+        except OSError:
             pass
 
     try:
@@ -81,7 +79,7 @@ def read_upstox_env() -> Dict[str, str]:
         for k in ("upstox_api_key", "upstox_api_secret", "upstox_redirect_uri", "upstox_user_id"):
             val = getattr(settings, k, "")
             if val:
-                env[k.upper()] = str(val).strip()
+                env.setdefault(k.upper(), str(val).strip())
     except Exception:
         pass
 
@@ -99,8 +97,6 @@ def read_upstox_env() -> Dict[str, str]:
 
     if not env.get("UPSTOX_REDIRECT_URI"):
         env["UPSTOX_REDIRECT_URI"] = "http://127.0.0.1:8500/api/upstox/callback"
-    if not env.get("UPSTOX_USER_ID"):
-        env["UPSTOX_USER_ID"] = "7JATYL"
 
     return env
 
@@ -130,20 +126,20 @@ class UpstoxAuth:
 
     def has_valid_token(self) -> bool:
         with self._lock:
-            return bool(self._access_token and not self._auth_required)
+            return bool(self._access_token and not self._auth_required
+                        and (self._token_expires_at is None or self._token_expires_at > datetime.now(IST)))
 
-    def missing_credentials(self) -> List[str]:
-        env = read_upstox_env()
-        missing = []
-        for key in ("UPSTOX_API_KEY", "UPSTOX_API_SECRET", "UPSTOX_REDIRECT_URI"):
-            if not env.get(key):
-                missing.append(key)
-        return missing
+    def missing_credentials(self, env: Optional[Dict[str, str]] = None) -> List[str]:
+        env = read_upstox_env() if env is None else env
+        return [
+            key for key in ("UPSTOX_API_KEY", "UPSTOX_API_SECRET", "UPSTOX_REDIRECT_URI")
+            if not env.get(key)
+        ]
 
     def login_url(self) -> str:
         """Construct the browser URL to initiate Upstox authorization."""
         env = read_upstox_env()
-        missing = self.missing_credentials()
+        missing = self.missing_credentials(env)
         if missing:
             raise ValueError(f"Cannot generate login URL: missing {', '.join(missing)}")
         params = {
@@ -181,7 +177,7 @@ class UpstoxAuth:
             ok, reason, profile = self._verify_live(extracted)
             if not ok:
                 raise RuntimeError(f"Upstox rejected access token: {reason}")
-            user_id = profile.get("user_id") or "7JATYL"
+            user_id = profile.get("user_id") or ""
             user_name = profile.get("user_name", "")
             exp = decode_jwt_expiry(extracted) or next_token_expiry()
             with self._lock:
@@ -204,76 +200,38 @@ class UpstoxAuth:
                 "connected": True,
             }
 
-        missing = self.missing_credentials()
+        env = read_upstox_env()
+        missing = self.missing_credentials(env)
         if missing:
             raise ValueError(f"Missing Upstox credentials: {', '.join(missing)}")
 
-        env = read_upstox_env()
-        base_uri = env.get("UPSTOX_REDIRECT_URI", "http://127.0.0.1:8500/api/upstox/callback")
+        # The broker consumes the code on the first exchange attempt, even on failure.
+        try:
+            resp = requests.post(
+                TOKEN_URL,
+                headers={"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "code": extracted,
+                    "client_id": env["UPSTOX_API_KEY"],
+                    "client_secret": env["UPSTOX_API_SECRET"],
+                    "redirect_uri": env["UPSTOX_REDIRECT_URI"],
+                    "grant_type": "authorization_code",
+                },
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError("Upstox token exchange request failed. Start a fresh login.") from exc
 
-        # Candidate redirect URIs to prevent URI mismatch errors
-        candidates = [base_uri]
-        if base_uri.endswith("/"):
-            candidates.append(base_uri.rstrip("/"))
-        else:
-            candidates.append(base_uri + "/")
-        if "127.0.0.1" in base_uri:
-            candidates.append(base_uri.replace("127.0.0.1", "localhost"))
-            candidates.append(base_uri.replace("127.0.0.1", "localhost").rstrip("/") + "/")
-        elif "localhost" in base_uri:
-            candidates.append(base_uri.replace("localhost", "127.0.0.1"))
-            candidates.append(base_uri.replace("localhost", "127.0.0.1").rstrip("/") + "/")
-        candidates.extend([
-            "http://127.0.0.1:8500/api/upstox/callback",
-            "http://localhost:8500/api/upstox/callback",
-            "http://127.0.0.1:8500",
-            "http://localhost:8500",
-            "http://127.0.0.1:5100",
-        ])
-
-        seen = set()
-        deduped_candidates = []
-        for c in candidates:
-            if c not in seen:
-                seen.add(c)
-                deduped_candidates.append(c)
-
-        result = None
-        first_error = ""
-        last_error = ""
-
-        for uri in deduped_candidates:
-            try:
-                resp = requests.post(
-                    TOKEN_URL,
-                    headers={"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-                    data={
-                        "code": extracted,
-                        "client_id": env["UPSTOX_API_KEY"],
-                        "client_secret": env["UPSTOX_API_SECRET"],
-                        "redirect_uri": uri,
-                        "grant_type": "authorization_code",
-                    },
-                    timeout=20,
-                )
-                if resp.status_code == 200:
-                    result = resp.json() or {}
-                    break
-                err_text = resp.text[:300]
-                if not first_error:
-                    first_error = f"HTTP {resp.status_code}: {err_text}"
-                last_error = f"HTTP {resp.status_code}: {err_text}"
-                # If error is not redirect URI mismatch, don't retry other candidates
-                if "redirect" not in err_text.lower() and "uri" not in err_text.lower() and "100068" not in err_text:
-                    break
-            except Exception as e:
-                if not first_error:
-                    first_error = str(e)
-                last_error = str(e)
-
-        if not result or not result.get("access_token"):
-            # If session is already authenticated and active, do not fail on duplicate/replayed code
-            if self.has_valid_token():
+        try:
+            result = resp.json()
+        except ValueError:
+            result = {}
+        if not isinstance(result, dict):
+            result = {}
+        if resp.status_code != 200 or not result.get("access_token"):
+            error = next((row for row in result.get("errors") or [] if isinstance(row, dict)), {})
+            code = str(error.get("errorCode") or error.get("error_code") or "")
+            if code == "UDAPI100057" and self.has_valid_token():
                 logger.info(
                     f"Upstox auth code already redeemed or expired, but session is ALREADY ACTIVE for {self._user_id}."
                 )
@@ -287,30 +245,19 @@ class UpstoxAuth:
                     "note": "Authorization code already redeemed; active session retained.",
                 }
 
-            detail = first_error or last_error
-            hint = ""
-            low = detail.lower()
-            if "udapi100057" in low:
-                hint = (
-                    " [UDAPI100057: Invalid Auth code. The authorization code expired (~2m) or was already redeemed. "
-                    "If already logged in, click Refresh in Upstox modal to sync session.]"
-                )
-            elif "udapi100016" in low:
-                hint = (
-                    " [UDAPI100016: Invalid Credentials. The authorization code expired (~2m) or was already used. "
-                    "Open Incognito window, visit /api/upstox_login, do NOT scan QR code: enter Phone -> OTP -> PIN (173089).]"
-                )
-            elif "udapi100068" in low or "redirect_uri" in low:
-                want = env.get("UPSTOX_REDIRECT_URI", "")
-                hint = f" [UDAPI100068: Upstox requires redirect_uri to match '{want}' exactly in Developer Console.]"
-            raise RuntimeError(f"Upstox rejected token exchange: {detail}{hint}")
+            detail = f"HTTP {resp.status_code}"
+            if code in {"UDAPI100068", "UDAPI100069", "UDAPI100016"}:
+                detail += f" {code}. Check the API key, secret, and exact redirect URI in Upstox Developer Apps."
+            elif code == "UDAPI100057":
+                detail += " UDAPI100057. The code expired or was already redeemed. Start a fresh login."
+            raise RuntimeError(f"Upstox rejected token exchange: {detail}")
 
         access_token = str(result.get("access_token") or "")
         ok, reason, profile = self._verify_live(access_token)
         if not ok:
             raise RuntimeError(f"Upstox token verification failed: {reason}")
 
-        user_id = str(result.get("user_id") or profile.get("user_id") or env.get("UPSTOX_USER_ID", "7JATYL"))
+        user_id = str(result.get("user_id") or profile.get("user_id") or env.get("UPSTOX_USER_ID", ""))
         user_name = str(profile.get("user_name", ""))
         exp = decode_jwt_expiry(access_token) or next_token_expiry()
 
@@ -341,7 +288,7 @@ class UpstoxAuth:
         now = datetime.now(IST)
         payload = {
             "access_token": access_token,
-            "user_id": session.get("user_id", "") or self._user_id or "7JATYL",
+            "user_id": session.get("user_id", "") or self._user_id or "",
             "user_name": session.get("user_name", "") or self._user_name,
             "issued_at": (self._token_issued_at or now).isoformat(),
             "expires_at": self._token_expires_at.isoformat() if self._token_expires_at else (now + timedelta(hours=24)).isoformat(),
@@ -392,7 +339,7 @@ class UpstoxAuth:
                 return
 
             self._access_token = token
-            self._user_id = user_id or "7JATYL"
+            self._user_id = user_id or ""
             self._user_name = user_name
             self._token_issued_at = issued_at
             self._token_expires_at = exp
@@ -467,7 +414,7 @@ class UpstoxAuth:
                 "connected": connected,
                 "auth_required": not connected,
                 "reason": "" if connected else (self._auth_reason or ("token expired" if token_expired else "authentication required")),
-                "user_id": self._user_id or "7JATYL",
+                "user_id": self._user_id or "",
                 "user_name": self._user_name,
                 "email": self._email,
                 "expires_at": expires_at.isoformat() if expires_at else None,
@@ -526,7 +473,7 @@ def exchange_code_for_token(
 complete_upstox_login = exchange_code_for_token
 
 
-def save_upstox_token(token: str, user_id: str = "7JATYL") -> None:
+def save_upstox_token(token: str, user_id: str = "") -> None:
     """Save Upstox access token directly."""
     auth = get_upstox_auth()
     auth.complete_login(token)
@@ -539,7 +486,7 @@ def load_upstox_token_data() -> Optional[Dict[str, Any]]:
     if auth.access_token:
         return {
             "access_token": auth.access_token,
-            "user_id": st.get("user_id", "7JATYL"),
+            "user_id": st.get("user_id", ""),
             "user_name": st.get("user_name", ""),
             "expires_at": st.get("expires_at"),
             "connected": st.get("connected", False),

@@ -118,29 +118,12 @@ def test_real_mode_switch_claims_the_lease_and_fails_closed():
     assert 'self.mode = "HISTORICAL"' in body, "must fail closed when the lease is refused"
 
 
-def test_dynamic_broker_is_given_an_account_id():
-    """Otherwise it silently builds no lease and loses cross-process protection.
+def test_angel_one_lease_uses_execution_account(monkeypatch):
+    from config.settings import get_settings
+    from trading.angelone_broker import AngelOneBroker
 
-    An empty account_id makes AccountExecutionLease None, so every lease guard fails
-    OPEN — the one guard that must never fail open, because two UT1 processes would
-    then net each other's positions on one account.
+    monkeypatch.setattr(get_settings(), "angelone_client_id", " ANGEL-ACCOUNT ")
+    broker = AngelOneBroker(instance_id="UT1:8500")
 
-    Matched on the constructor call rather than a class name: this test passed for the
-    whole AngelOne era and then went stale the moment the broker changed, while the
-    dynamic path was still handing the lease an angelone_client_id that no longer
-    exists.
-    """
-    import inspect
-    import re
-
-    from scanner import Scanner
-
-    body = inspect.getsource(Scanner.configure)
-    calls = re.findall(r"\b(\w*Broker)\(\s*(.{0,400})", body, re.S)
-    assert calls, "Scanner.configure builds no broker at all"
-    for name, seg in calls:
-        assert "account_id" in seg, f"dynamic {name} built without account_id"
-        assert "instance_id" in seg, f"dynamic {name} built without instance_id"
-        assert "angelone" not in seg.lower(), (
-            f"dynamic {name} still keys its lease on a retired AngelOne setting"
-        )
+    assert broker.client_id == "ANGEL-ACCOUNT"
+    assert broker.execution_lease_established() is True

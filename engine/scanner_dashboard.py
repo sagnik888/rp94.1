@@ -212,6 +212,7 @@ class ScannerTradePayloadBuilder:
             ),
             "grade_preference": str(getattr(get_settings(), "signal_grade_preference", "auto") or "auto"),
             "timeframe_entry_policy": str(getattr(get_settings(), "ut_timeframe_entry_policy", "PRIMARY_15") or "PRIMARY_15").upper(),
+            "strict_entry_timeframes": bool(getattr(get_settings(), "strict_entry_timeframes", False)),
             "open_rows": len(payload.get("open", []) or []),
             "closed_rows": len(payload.get("closed", []) or []),
             "restored_signal_rows": 0,

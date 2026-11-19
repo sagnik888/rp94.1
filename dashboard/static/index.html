@@ -241,11 +241,11 @@
                 </div>
 
                 <div class="gateway-status-panel">
-                    <div class="gateway-badge" id="gw_upstox" style="cursor: pointer;" onclick="window.startUpstoxAuthFlow && window.startUpstoxAuthFlow()" title="Upstox Primary Broker. Click to log in / refresh.">
+                    <div class="gateway-badge" id="gw_upstox" style="cursor: pointer;" onclick="window.startUpstoxAuthFlow && window.startUpstoxAuthFlow()" title="Upstox market data. Click to log in or refresh.">
                         <span class="gw-dot"></span> UPSTOX
                     </div>
-                    <div class="gateway-badge" id="gw_angelone" title="AngelOne 30s Fallback Broker">
-                        <span class="gw-dot"></span> ANGEL (BACKUP)
+                    <div class="gateway-badge" id="gw_angelone" role="status" title="Angel One order execution">
+                        <span class="gw-dot" aria-hidden="true"></span> ANGEL ONE · <span id="gw_angelone_state">CHECKING</span>
                     </div>
                     <div class="gateway-badge" id="gw_kite" style="display:none;"></div>
                     <div class="gateway-badge" id="gw_fyers" style="display:none;"></div>
@@ -289,6 +289,7 @@
                     <button class="intel-tab" data-target="pnlContentView">P&L</button>
                 </div>
                 <div class="header-right-actions" style="display:flex; align-items:center; gap:8px;">
+                    <span class="diag-mode" id="intelDataAsOf">Waiting for data</span>
                     <div id="manipulationAlert" class="manipulation-banner" style="display: none;">PRESSURE DIVERGENCE</div>
                     <span class="diag-mode" id="diagMode" style="display: none;">--</span>
                 </div>
@@ -349,9 +350,9 @@
                         <div class="intel-card glass-card">
                             <div class="intel-card-title">💊 Options Health</div>
                             <div class="greek-subgrid">
-                                <div class="greek-item"><span>VIX Regime </span><b id="greekIV">--</b></div>
-                                <div class="greek-item"><span>Move UP </span><b id="greekCallDelta">--</b></div>
-                                <div class="greek-item"><span>Move DN </span><b id="greekPutDelta">--</b></div>
+                                <div class="greek-item"><span>India VIX </span><b id="greekIV">--</b></div>
+                                <div class="greek-item"><span>Call per +100 </span><b id="greekCallDelta">--</b></div>
+                                <div class="greek-item"><span>Put per −100 </span><b id="greekPutDelta">--</b></div>
                                 <div class="greek-item"><span>Decay </span><b id="greekTheta">--</b></div>
                             </div>
                             <div class="intel-card-label" id="greekSummary">Interpretation...</div>
@@ -862,7 +863,7 @@
          running dashboard because the version string still said v=24. -->
     <script src="/static/js/dashboard-settings.js?v=53-s12-dual-engine"></script>
     <script src="/static/js/signal-forensics.js?v=3-integration-fixed"></script>
-    <script src="/static/js/app.js?v=oct2026-v56-intel-truthful-native-atr"></script>
+    <script src="/static/js/app.js?v=oct2026-v58-execution-badge"></script>
 </body>
 
 

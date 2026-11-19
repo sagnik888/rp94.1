@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import requests
 import pandas as pd
 import json
@@ -11,6 +12,7 @@ from datetime import datetime, date, time as dt_time, timedelta
 from typing import Dict, List, Optional, Set
 from loguru import logger
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 class ExpiryManager:
     """
@@ -24,7 +26,11 @@ class ExpiryManager:
     OPTION_ROLLOVER_DAYS = 2  # legacy calendar constant; option rollover now uses
     # option_rollover_working_days (trading-day, holiday-aware) — see _trading_days_until.
 
-    def __init__(self):
+    UPSTOX_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+    UPSTOX_CACHE_FILE = CACHE_DIR / "upstox_instruments.json"
+
+    def __init__(self, *, upstox_only=False):
+        self.upstox_only = upstox_only
         self.df: Optional[pd.DataFrame] = None
         self.expiries: Dict[str, Dict] = {}
         self.CACHE_DIR.mkdir(exist_ok=True)
@@ -52,7 +58,7 @@ class ExpiryManager:
             float(strike) * 100 and the closest-strike fallback divides by 100.
         """
         try:
-            from config import get_settings
+            from config.settings import get_settings
             cfg = get_settings()
             kite_key = str(getattr(cfg, "kite_api_key", "") or "").strip()
             if not kite_key:
@@ -123,12 +129,103 @@ class ExpiryManager:
     # cannot help; the window is short enough to pick the session up promptly.
     MASTER_RETRY_COOLDOWN_SECONDS = 60.0
 
+    @staticmethod
+    def _normalize_upstox_rows(raw_rows):
+        from data.upstox_market_data import UPSTOX_INDEX_KEYS
+
+        rows = []
+        ist = ZoneInfo("Asia/Kolkata")
+        for row in raw_rows:
+            name = row.get("underlying_symbol")
+            segment = row.get("segment")
+            kind = row.get("instrument_type")
+            key = str(row.get("instrument_key") or "")
+            if (name not in UPSTOX_INDEX_KEYS or row.get("underlying_key") != UPSTOX_INDEX_KEYS[name]
+                    or segment not in {"NSE_FO", "BSE_FO"} or not key.startswith(segment + "|")
+                    or kind not in {"CE", "PE", "FUT"} or not row.get("trading_symbol")):
+                continue
+            try:
+                expiry = datetime.fromtimestamp(int(row["expiry"]) / 1000, ist).strftime("%d%b%Y").upper()
+                lot_size = int(row["lot_size"])
+                if lot_size <= 0:
+                    continue
+                rows.append({
+                    "token": key, "symbol": row["trading_symbol"], "name": name, "expiry": expiry,
+                    "strike": float(row.get("strike_price") or 0) * 100, "lotsize": lot_size,
+                    "instrumenttype": "FUTIDX" if kind == "FUT" else "OPTIDX",
+                    "option_type": kind, "tick_size": float(row["tick_size"]) / 100,
+                    "exch_seg": "BFO" if segment == "BSE_FO" else "NFO",
+                })
+            except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                continue
+        return pd.DataFrame(rows)
+
+    def _download_upstox_master(self, force):
+        cache = self.UPSTOX_CACHE_FILE
+        try:
+            if not force and datetime.fromtimestamp(cache.stat().st_mtime, ZoneInfo("Asia/Kolkata")).date() == datetime.now(ZoneInfo("Asia/Kolkata")).date():
+                frame = pd.read_json(cache, orient="records")
+                if not frame.empty and frame["token"].str.match(r"^(NSE|BSE)_FO\|[0-9]+$").all():
+                    self._staged_df = frame
+                    return True
+        except (OSError, ValueError, KeyError, AttributeError):
+            pass
+        try:
+            response = requests.get(self.UPSTOX_MASTER_URL, timeout=15)
+            response.raise_for_status()
+            data = response.content
+            rows = json.loads(gzip.decompress(data) if data.startswith(b"\x1f\x8b") else data)
+            frame = self._normalize_upstox_rows(rows)
+        except (OSError, requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+            logger.warning(f"Upstox instrument master unavailable: {exc}")
+            return False
+        if frame.empty:
+            logger.error("Upstox instrument master contains no supported index contracts")
+            return False
+        self._staged_df = frame
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=cache.parent, delete=False) as output:
+                staged = Path(output.name)
+                frame.to_json(output, orient="records")
+            try:
+                os.replace(staged, cache)
+            finally:
+                staged.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(f"Could not persist Upstox instrument master: {exc}")
+        return True
+
+    @staticmethod
+    def _option_type_mask(frame, option_type):
+        if "option_type" in frame:
+            return frame["option_type"].eq(option_type)
+        return frame["symbol"].str.endswith(option_type)
+
+    def upstox_tick_size(self, key):
+        contract = self.upstox_contract(key)
+        return float(contract["tick_size"]) if contract and "tick_size" in contract else None
+
+    def upstox_contract(self, key, *, require_current=False):
+        with self._state_lock:
+            frame = self.df
+            loaded_date = self._loaded_date
+        if frame is None or (require_current and loaded_date != datetime.now(ZoneInfo("Asia/Kolkata")).date()):
+            return None
+        matches = frame.loc[frame["token"].eq(key)]
+        return matches.iloc[0].to_dict() if len(matches) == 1 else None
+
     def download_master(self, force=False):
         """Load a candidate master without exposing a half-analyzed snapshot."""
         with self._refresh_lock:
             blocked_until = float(getattr(self, "_master_failure_until", 0.0) or 0.0)
             if not force and time.monotonic() < blocked_until:
                 return False
+            if getattr(self, "upstox_only", False):
+                loaded = self._download_upstox_master(force)
+                self._master_failure_until = (0.0 if loaded else
+                    time.monotonic() + self.MASTER_RETRY_COOLDOWN_SECONDS)
+                return loaded
             # Check Kite master if available; otherwise fallback to AngelOne ScripMaster
             frame = self._kite_master_frame()
             if frame is not None and not frame.empty:
@@ -358,7 +455,7 @@ class ExpiryManager:
             usable = self.df is not None and not self.df.empty and bool(self.expiries)
             if usable:
                 self._start_background_refresh()
-                return True
+                return not getattr(self, "upstox_only", False)
             # Token/expiry lookups are called from the scanner's asyncio loop.
             # A cold cache must fail closed and warm in the background instead
             # of running the 30-second HTTP download on that latency-sensitive
@@ -609,7 +706,7 @@ class ExpiryManager:
         opt_df = self.df[
             (self.df["name"] == name)
             & (self.df["instrumenttype"].isin(["OPTIDX"]))
-            & (self.df["symbol"].str.endswith(option_type))
+            & self._option_type_mask(self.df, option_type)
             & (self.df["expiry_dt"] == expiry_dt)
         ].copy()
         if opt_df.empty:
@@ -704,7 +801,7 @@ class ExpiryManager:
             (self.df['name'] == name) & 
             (self.df['expiry'] == expiry_val) & 
             (self.df['strike'].astype(float) == float(strike) * 100) & # AngelOne uses strike * 100
-            (self.df['symbol'].str.endswith(option_type))
+            self._option_type_mask(self.df, option_type)
         ]
         
         if not match.empty:
@@ -716,7 +813,7 @@ class ExpiryManager:
         if not nifty_opt.empty:
             logger.warning(f"Exact strike {strike} not found for {name} on {expiry_val}. Finding closest available...")
             # Filter by option type too to avoid mismatch
-            opt_type_filtered = nifty_opt[nifty_opt['symbol'].str.endswith(option_type)].copy()
+            opt_type_filtered = nifty_opt[self._option_type_mask(nifty_opt, option_type)].copy()
             if not opt_type_filtered.empty:
                 opt_type_filtered['strike_val'] = opt_type_filtered['strike'].astype(float) / 100.0
                 opt_type_filtered['diff'] = (opt_type_filtered['strike_val'] - float(strike)).abs()
@@ -940,4 +1037,4 @@ class ArchivedExpiryContext:
 
 
 # Singleton for live execution only; historical callers use ArchivedExpiryContext.
-expiry_manager = ExpiryManager()
+expiry_manager = ExpiryManager(upstox_only=True)
